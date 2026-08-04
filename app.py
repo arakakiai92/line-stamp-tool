@@ -29,14 +29,30 @@ def remove_white_background(pil_img, threshold=240):
     return Image.fromarray(data)
 
 def optimize_apng_bytes(img_list, duration_ms):
-    """LINEの1MB制限に収めるため自動減色してAPNG化"""
-    colors_list = [256, 128, 64, 32]
+    """LINEの1MB制限に安全に適合させてAPNG化する関数"""
+    # 1. 標準のRGBAモードでAPNG生成（320x270px以下の透過画像なら基本的に1MB以下になります）
+    buf = io.BytesIO()
+    img_list[0].save(
+        buf,
+        format="PNG",
+        save_all=True,
+        append_images=img_list[1:],
+        duration=duration_ms,
+        loop=0
+    )
+    data = buf.getvalue()
+    
+    # 1MB (約990KB) 未満ならそのまま採用
+    if len(data) < 990000:
+        return data
+        
+    # 2. 万が一1MBを超えた場合は、RGBAモードを維持したまま安全に減色
+    colors_list = [128, 64, 32]
     for colors in colors_list:
         quantized_imgs = []
         for img in img_list:
-            alpha = img.split()[-1]
-            q_img = img.convert('P', palette=Image.Palette.ADAPTIVE, colors=colors)
-            q_img.putalpha(alpha)
+            # 減色後にRGBAへ戻すことでエラー（PAモード化）を防止
+            q_img = img.quantize(colors=colors, method=Image.Quantize.FASTOCTREE).convert("RGBA")
             quantized_imgs.append(q_img)
             
         buf = io.BytesIO()
@@ -49,8 +65,9 @@ def optimize_apng_bytes(img_list, duration_ms):
             loop=0
         )
         data = buf.getvalue()
-        if len(data) < 990000: # 1MB未満なら採用
+        if len(data) < 990000:
             return data
+            
     return data
 
 if uploaded_file is not None:
