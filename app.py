@@ -112,7 +112,6 @@ def process_frame_sequence(frames, start_frame, end_frame, ping_pong=False, trim
         reverse_part = sub[-2:0:-1]
         sub = sub + reverse_part
         
-    # LINE規定: 20コマ以内に収める
     if len(sub) > 20:
         indices = np.linspace(0, len(sub) - 1, 20, dtype=int)
         sub = [sub[i] for i in indices]
@@ -162,48 +161,50 @@ uploaded_file = st.file_uploader("1. 動画ファイル (MP4 / MOV) をアップ
 if uploaded_file is not None:
     if st.button("🔍 動画を解析して編集画面へ進む"):
         with st.spinner("動画のコマ分割・透過・センタリング処理中..."):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
-                uploaded_file.seek(0)
-                tfile.write(uploaded_file.read())
-                temp_path = tfile.name
-                
-            cap = cv2.VideoCapture(temp_path)
-            fps = cap.get(cv2.CAP_PROP_FPS) or 10
-            st.session_state['fps'] = fps
-            
-            raw_frames = []
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                raw_frames.append(frame)
-            cap.release()
-            
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-                
-            if raw_frames:
-                h, w, _ = raw_frames[0].shape
-                cell_h, cell_w = h // ROWS, w // COLS
-                raw_stamps = {i: [] for i in range(12)}
-                
-                for frame in raw_frames:
-                    for r in range(ROWS):
-                        for c in range(COLS):
-                            idx = r * COLS + c
-                            cell = frame[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w]
-                            transparent_cell = remove_background_floodfill(cell)
-                            raw_stamps[idx].append(transparent_cell)
-                            
-                # センタリング処理を適用
-                centered_stamps = {}
-                for idx in range(12):
-                    centered_stamps[idx] = center_and_fit_stamp(raw_stamps[idx])
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
+                    uploaded_file.seek(0)
+                    tfile.write(uploaded_file.read())
+                    temp_path = tfile.name
                     
-                st.session_state['processed_stamps'] = centered_stamps
-                st.success("解析が完了しました！下部の編集エリアで調整を行ってください。")
-            else:
-                st.error("動画フレームの読み込みに失敗しました。正しい動画ファイルかご確認ください。")
+                cap = cv2.VideoCapture(temp_path)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 10
+                st.session_state['fps'] = fps
+                
+                raw_frames = []
+                while cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    raw_frames.append(frame)
+                cap.release()
+                
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                    
+                if raw_frames:
+                    h, w, _ = raw_frames[0].shape
+                    cell_h, cell_w = h // ROWS, w // COLS
+                    raw_stamps = {i: [] for i in range(12)}
+                    
+                    for frame in raw_frames:
+                        for r in range(ROWS):
+                            for c in range(COLS):
+                                idx = r * COLS + c
+                                cell = frame[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w]
+                                transparent_cell = remove_background_floodfill(cell)
+                                raw_stamps[idx].append(transparent_cell)
+                                
+                    centered_stamps = {}
+                    for idx in range(12):
+                        centered_stamps[idx] = center_and_fit_stamp(raw_stamps[idx])
+                        
+                    st.session_state['processed_stamps'] = centered_stamps
+                    st.success("解析が完了しました！下部の編集エリアで調整を行ってください。")
+                else:
+                    st.error("動画フレームの読み込みに失敗しました。正しい動画ファイルかご確認ください。")
+            except Exception as e:
+                st.error(f"解析中にエラーが発生しました: {e}")
 
 # --- Step 2: プレビュー ＆ 高度編集エリア ---
 if st.session_state['processed_stamps'] is not None:
@@ -211,17 +212,15 @@ if st.session_state['processed_stamps'] is not None:
     st.header("🎛️ スタンプ編集 ＆ リアルタイムプレビュー")
     
     stamps_data = st.session_state['processed_stamps']
-    max_raw_frames = len(stamps_data[0]) if stamps_data else 10
+    max_raw_frames = max(1, len(stamps_data.get(0, [])))
     
     col_preview, col_controls = st.columns([1, 1.2])
     
     with col_controls:
         st.subheader("🛠️ 編集コントロール")
         
-        # スタンプ選択
         selected_stamp_idx = st.number_input("確認・編集するスタンプ番号 (1〜12)", min_value=1, max_value=12, value=1) - 1
         
-        # コマ範囲（トリミング）選択
         if max_raw_frames > 1:
             frame_range = st.slider(
                 "使用するコマ（フレーム）範囲の切り出し",
@@ -232,20 +231,16 @@ if st.session_state['processed_stamps'] is not None:
         else:
             frame_range = (1, 1)
         
-        # ループオプション
         ping_pong = st.checkbox("🔄 往復再生（ピンポンループ）を有効にする", value=False, help="1➔2➔3➔2 のように動きを往復させて滑らかな無限ループを作成します")
         trim_end = st.checkbox("✂️ ループ時の最後の重複コマを1枚カットする", value=True, help="ループ直前のカクつき・一瞬の停止を防ぎます")
         
-        # 時間・ループ数
         st.markdown("---")
         target_sec = st.selectbox("総再生時間 (LINE規定: 1~4秒の整数秒)", [1, 2, 3, 4], index=1)
         loop_count = st.selectbox("1スタンプあたりのループ回数", [1, 2, 3, 4], index=1)
         
-        # コマ処理の適用
-        current_raw_frames = stamps_data.get(selected_stamp_idx, stamps_data[0])
+        current_raw_frames = stamps_data.get(selected_stamp_idx, stamps_data.get(0, []))
         edited_frames = process_frame_sequence(current_raw_frames, frame_range[0], frame_range[1], ping_pong, trim_end)
         
-        # 1コマの表示時間計算
         total_ms = target_sec * 1000
         loop_ms = total_ms // loop_count
         frame_cnt = max(1, len(edited_frames))
@@ -255,9 +250,8 @@ if st.session_state['processed_stamps'] is not None:
         
     with col_preview:
         st.subheader("👁️ リアルタイムアニメーション")
-        # プレビューGIF生成＆表示
         preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
-        st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} プレビュー", use_column_width=True)
+        st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} プレビュー")
         
     st.divider()
     
@@ -266,28 +260,29 @@ if st.session_state['processed_stamps'] is not None:
     
     if st.button("🚀 LINE審査適合APNGを一括ダウンロード (ZIP)"):
         with st.spinner("12個のスタンプを設定に従って一括書き出し中..."):
-            zip_buffer = io.BytesIO()
-            
-            # 各コマの表示時間リスト（ミリ秒誤差なし）
-            frame_cnt = max(1, len(edited_frames))
-            base_ms = loop_ms // frame_cnt
-            remainder = loop_ms % frame_cnt
-            durations_list = [base_ms] * frame_cnt
-            for i in range(remainder):
-                durations_list[i] += 1
-                
-            with zipfile.ZipFile(zip_buffer, "w") as zip_file:
-                for idx in range(12):
-                    raw_f = stamps_data[idx]
-                    proc_f = process_frame_sequence(raw_f, frame_range[0], frame_range[1], ping_pong, trim_end)
-                    apng_data = optimize_apng_bytes(proc_f, durations_list, loop_count)
-                    zip_file.writestr(f"stamp_{idx+1:02d}.png", apng_data)
+            try:
+                zip_buffer = io.BytesIO()
+                frame_cnt = max(1, len(edited_frames))
+                base_ms = loop_ms // frame_cnt
+                remainder = loop_ms % frame_cnt
+                durations_list = [base_ms] * frame_cnt
+                for i in range(remainder):
+                    durations_list[i] += 1
                     
-            st.success("🎉 全12個のアニメーションスタンプの出力が完了しました！")
-            
-            st.download_button(
-                label="📦 LINE審査適合スタンプ一括ダウンロード (ZIP)",
-                data=zip_buffer.getvalue(),
-                file_name="line_animation_stamps.zip",
-                mime="application/zip"
-            )
+                with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+                    for idx in range(12):
+                        raw_f = stamps_data.get(idx, [])
+                        proc_f = process_frame_sequence(raw_f, frame_range[0], frame_range[1], ping_pong, trim_end)
+                        apng_data = optimize_apng_bytes(proc_f, durations_list, loop_count)
+                        zip_file.writestr(f"stamp_{idx+1:02d}.png", apng_data)
+                        
+                st.success("🎉 全12個のアニメーションスタンプの出力が完了しました！")
+                
+                st.download_button(
+                    label="📦 LINE審査適合スタンプ一括ダウンロード (ZIP)",
+                    data=zip_buffer.getvalue(),
+                    file_name="line_animation_stamps.zip",
+                    mime="application/zip"
+                )
+            except Exception as e:
+                st.error(f"書き出し中にエラーが発生しました: {e}")
