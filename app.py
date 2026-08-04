@@ -6,36 +6,25 @@ import io
 import zipfile
 import os
 
-st.set_page_config(page_title="LINEアニメーションスタンプ自動生成（ガイドライン厳守版）", layout="centered")
+st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="centered")
 
-st.title("⚡ LINEアニメーションスタンプ自動生成")
-st.caption("LINE審査ガイドライン（フレーム数5~20 / 再生時間1~4秒の整数秒 / ループ数1~4回 / 1MB以下 / 背景透過 / センタリング）に100%自動適合させます。")
+st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
+st.caption("動画解析後、プレビューを見ながら「コマ削除」「往復再生」「速度調整」を自由に行い、LINE審査ガイドライン適合APNGを一括出力できます。")
 
-uploaded_file = st.file_uploader("動画ファイル (MP4 / MOV) を選択してください", type=["mp4", "mov"])
-
-# ループ・秒数の設定モード
-st.subheader("⚙️ アニメーション再生設定")
-mode = st.radio("設定モードを選択してください", ["🤖 自動最適化 (動画の長さに合わせてLINE規約に最適設定)", "⚙️ 手動指定 (再生時間とループ数を自分で指定)"])
-
-manual_target_sec = 2
-manual_loop_count = 2
-
-if "手動指定" in mode:
-    col1, col2 = st.columns(2)
-    with col1:
-        manual_target_sec = st.selectbox("総再生時間 (整数秒)", [1, 2, 3, 4], index=1, help="スタンプの全体の長さです（最大4秒）")
-    with col2:
-        manual_loop_count = st.selectbox("ループ回数", [1, 2, 3, 4], index=1, help="1スタンプあたりの繰り返し回数です")
+# セッション状態の初期化
+if 'processed_stamps' not in st.session_state:
+    st.session_state['processed_stamps'] = None
+if 'fps' not in st.session_state:
+    st.session_state['fps'] = 10
 
 ROWS = 3
 COLS = 4
 
 def remove_background_floodfill(cell_bgr, tolerance=40):
-    """外枠からの塗りつぶしにより、キャラ内部の白パーツを保護しながら背景のみを透過する関数"""
+    """キャラ内部の白を保護しながら背景のみ透過"""
     h, w, _ = cell_bgr.shape
     mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
     img_work = cell_bgr.copy()
-    
     bg_color = cell_bgr[0, 0].astype(np.float32)
     
     seeds = []
@@ -56,36 +45,27 @@ def remove_background_floodfill(cell_bgr, tolerance=40):
             pixel_color = cell_bgr[seed_y, seed_x].astype(np.float32)
             color_dist = np.linalg.norm(pixel_color - bg_color)
             if color_dist <= tolerance * 1.5:
-                cv2.floodFill(
-                    img_work,
-                    mask,
-                    seedPoint=(seed_x, seed_y),
-                    newVal=(0, 0, 0),
-                    loDiff=lo_diff,
-                    upDiff=up_diff,
-                    flags=flags
-                )
+                cv2.floodFill(img_work, mask, seedPoint=(seed_x, seed_y), newVal=(0, 0, 0),
+                              loDiff=lo_diff, upDiff=up_diff, flags=flags)
             
     bg_mask = mask[1:h+1, 1:w+1]
     alpha = np.where(bg_mask == 255, 0, 255).astype(np.uint8)
-    
     alpha_blurred = cv2.GaussianBlur(alpha, (3, 3), 0)
     _, alpha_smoothed = cv2.threshold(alpha_blurred, 127, 255, cv2.THRESH_BINARY)
     
     b, g, r = cv2.split(cell_bgr)
     cell_bgra = cv2.merge([b, g, r, alpha_smoothed])
-    cell_rgba = cv2.cvtColor(cell_bgra, cv2.COLOR_BGRA2RGBA)
-    return Image.fromarray(cell_rgba)
+    return Image.fromarray(cv2.cvtColor(cell_bgra, cv2.COLOR_BGRA2RGBA))
 
 def center_and_fit_stamp(frame_list, target_w=320, target_h=270, padding=12):
-    """キャラクターを認識して中央寄せセンタリング配置する関数"""
+    """キャラを認識して中央寄せ配置"""
     if not frame_list:
         return frame_list
         
     alphas = [np.array(img)[:, :, 3] for img in frame_list]
     stacked_alpha = np.maximum.reduce(alphas)
-    
     non_zeros = np.argwhere(stacked_alpha > 10)
+    
     if non_zeros.size == 0:
         return [img.resize((target_w, target_h), Image.Resampling.LANCZOS) for img in frame_list]
         
@@ -112,178 +92,191 @@ def center_and_fit_stamp(frame_list, target_w=320, target_h=270, padding=12):
     for img in frame_list:
         cropped = img.crop((min_x, min_y, max_x + 1, max_y + 1))
         resized = cropped.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        
         canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
         canvas.paste(resized, (offset_x, offset_y), mask=resized)
         centered_frames.append(canvas)
         
     return centered_frames
 
-def calculate_line_animation_timing(raw_duration_sec, num_frames, is_auto, user_sec=2, user_loop=2):
-    """LINEの厳格な「整数秒」「ループ数1~4」規約にミリ秒単位でぴったり合わせる計算関数"""
-    if not is_auto:
-        total_sec = user_sec
-        loop_count = user_loop
-        loop_target_ms = (total_sec * 1000) // loop_count
-    else:
-        candidates = []
-        for total_target_sec in [1, 2, 3, 4]:
-            for loop_count in [1, 2, 3, 4]:
-                total_target_ms = total_target_sec * 1000
-                if total_target_ms % loop_count != 0:
-                    continue
-                loop_target_ms = total_target_ms // loop_count
-                avg_frame_ms = loop_target_ms / num_frames
-                
-                if avg_frame_ms < 50 or avg_frame_ms > 500:
-                    continue
-                    
-                loop_sec = loop_target_ms / 1000.0
-                speed_ratio = loop_sec / raw_duration_sec if raw_duration_sec > 0 else 1.0
-                speed_penalty = abs(speed_ratio - 1.0)
-                duration_preference = -0.05 * total_target_sec
-                score = speed_penalty + duration_preference
-                
-                candidates.append({
-                    'loop_count': loop_count,
-                    'total_sec': total_target_sec,
-                    'loop_ms': loop_target_ms,
-                    'score': score
-                })
-                
-        if not candidates:
-            total_sec, loop_count, loop_target_ms = 2, 2, 1000
-        else:
-            candidates.sort(key=lambda x: x['score'])
-            best = candidates[0]
-            total_sec = best['total_sec']
-            loop_count = best['loop_count']
-            loop_target_ms = best['loop_ms']
-
-    # 1コマあたりの表示時間を分配（合計が正確に1ループのミリ秒になるよう補正）
-    base_ms = loop_target_ms // num_frames
-    remainder = loop_target_ms % num_frames
-    durations = [base_ms] * num_frames
-    for i in range(remainder):
-        durations[i] += 1
+def process_frame_sequence(frames, start_frame, end_frame, ping_pong=False, trim_end=False):
+    """コマの選択・トリミング・往復再生・重複削除処理"""
+    sub = frames[start_frame - 1 : end_frame]
+    if not sub:
+        return frames
         
-    return loop_count, total_sec, durations
+    if trim_end and len(sub) > 2:
+        sub = sub[:-1]
+        
+    if ping_pong and len(sub) > 2:
+        reverse_part = sub[-2:0:-1]
+        sub = sub + reverse_part
+        
+    # LINE規定: 20コマ以内に収める
+    if len(sub) > 20:
+        indices = np.linspace(0, len(sub) - 1, 20, dtype=int)
+        sub = [sub[i] for i in indices]
+    elif len(sub) < 5:
+        # 5コマ未満の場合は5コマまで補完
+        while len(sub) < 5:
+            sub.append(sub[-1])
+            
+    return sub
+
+def create_preview_gif(frame_list, duration_ms):
+    """プレビュー用Web GIF作成"""
+    buf = io.BytesIO()
+    frame_list[0].save(
+        buf, format="GIF", save_all=True,
+        append_images=frame_list[1:], duration=duration_ms, loop=0, disposal=2
+    )
+    return buf.getvalue()
 
 def optimize_apng_bytes(img_list, durations, loop_count):
-    """指定されたループ回数とコマ表示時間で1MB以下に抑えてAPNG保存する関数"""
+    """LINE 1MB以下適合APNG出力"""
     buf = io.BytesIO()
     img_list[0].save(
-        buf,
-        format="PNG",
-        save_all=True,
-        append_images=img_list[1:],
-        duration=durations,
-        loop=loop_count  # LINE規定の1~4回のループ数を正しく指定
+        buf, format="PNG", save_all=True,
+        append_images=img_list[1:], duration=durations, loop=loop_count
     )
     data = buf.getvalue()
-    
     if len(data) < 990000:
         return data
         
-    colors_list = [128, 64, 32]
-    for colors in colors_list:
-        quantized_imgs = []
-        for img in img_list:
-            q_img = img.quantize(colors=colors, method=Image.Quantize.FASTOCTREE).convert("RGBA")
-            quantized_imgs.append(q_img)
-            
+    for colors in [128, 64, 32]:
+        quantized_imgs = [img.quantize(colors=colors, method=Image.Quantize.FASTOCTREE).convert("RGBA") for img in img_list]
         buf = io.BytesIO()
         quantized_imgs[0].save(
-            buf,
-            format="PNG",
-            save_all=True,
-            append_images=quantized_imgs[1:],
-            duration=durations,
-            loop=loop_count
+            buf, format="PNG", save_all=True,
+            append_images=quantized_imgs[1:], duration=durations, loop=loop_count
         )
         data = buf.getvalue()
         if len(data) < 990000:
             return data
-            
     return data
 
-if uploaded_file is not None:
-    if st.button("🚀 審査適合スタンプを一括生成"):
-        st.info("動画を解析し、LINEガイドライン適合処理（コマ数・再生時間・ループ数調整・透過・センタリング）を実行中です...")
-        
-        temp_path = "temp_input.mp4"
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_file.read())
-            
-        cap = cv2.VideoCapture(temp_path)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 10
-        
-        frames = []
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frames.append(frame)
-        cap.release()
-        
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-            
-        if not frames:
-            st.error("動画の読み込みに失敗しました。")
-        else:
-            # 1. フレーム（コマ）数の調整（規約: 5～20フレーム）
-            total_f = len(frames)
-            target_f_count = min(20, max(5, total_f))
-            if total_f > 20:
-                indices = np.linspace(0, total_f - 1, 20, dtype=int)
-                selected_frames = [frames[i] for i in indices]
-            elif total_f < 5:
-                st.error("動画のコマ数が短すぎます（最低5コマ必要です）。")
-                st.stop()
-            else:
-                selected_frames = frames
+# --- Step 1: 動画のアップロード ＆ 解析 ---
+uploaded_file = st.file_uploader("1. 動画ファイル (MP4 / MOV) をアップロードしてください", type=["mp4", "mov"])
 
-            # 2. 秒数＆ループ回数の計算（規約: 1~4秒の整数秒、ループ1~4回）
-            raw_duration_sec = len(selected_frames) / fps
-            is_auto = "自動最適化" in mode
-            loop_count, total_sec, durations_list = calculate_line_animation_timing(
-                raw_duration_sec, len(selected_frames), is_auto, manual_target_sec, manual_loop_count
-            )
-            
-            # 3. グリッド切出 ＆ キャラ内部白保護透過処理
-            h, w, _ = selected_frames[0].shape
-            cell_h = h // ROWS
-            cell_w = w // COLS
-            
-            raw_stamp_frames = {i: [] for i in range(12)}
-            progress_bar = st.progress(0)
-            
-            for f_idx, frame in enumerate(selected_frames):
-                for r in range(ROWS):
-                    for c in range(COLS):
-                        idx = r * COLS + c
-                        cell = frame[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w]
-                        
-                        transparent_cell = remove_background_floodfill(cell)
-                        raw_stamp_frames[idx].append(transparent_cell)
+if uploaded_file is not None:
+    if st.button("🔍 動画を解析して編集画面へ進む"):
+        with st.spinner("動画のコマ分割・透過・センタリング処理中..."):
+            temp_path = "temp_input.mp4"
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.read())
                 
-                progress_bar.progress((f_idx + 1) / len(selected_frames))
+            cap = cv2.VideoCapture(temp_path)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 10
+            st.session_state['fps'] = fps
+            
+            raw_frames = []
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                raw_frames.append(frame)
+            cap.release()
+            
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
                 
-            # 4. キャラ自動認識 ＆ センタリング ＆ 規約適合APNG書き出し
+            if raw_frames:
+                h, w, _ = raw_frames[0].shape
+                cell_h, cell_w = h // ROWS, w // COLS
+                raw_stamps = {i: [] for i in range(12)}
+                
+                for frame in raw_frames:
+                    for r in range(ROWS):
+                        for c in range(COLS):
+                            idx = r * COLS + c
+                            cell = frame[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w]
+                            transparent_cell = remove_background_floodfill(cell)
+                            raw_stamps[idx].append(transparent_cell)
+                            
+                # センタリング処理を適用
+                centered_stamps = {}
+                for idx in range(12):
+                    centered_stamps[idx] = center_and_fit_stamp(raw_stamps[idx])
+                    
+                st.session_state['processed_stamps'] = centered_stamps
+                st.success("解析が完了しました！下部の編集エリアで調整を行ってください。")
+
+# --- Step 2: プレビュー ＆ 高度編集エリア ---
+if st.session_state['processed_stamps'] is not None:
+    st.divider()
+    st.header("🎛️ スタンプ編集 ＆ リアルタイムプレビュー")
+    
+    stamps_data = st.session_state['processed_stamps']
+    max_raw_frames = len(stamps_data[0])
+    
+    col_preview, col_controls = st.columns([1, 1.2])
+    
+    with col_controls:
+        st.subheader("🛠️ 編集コントロール")
+        
+        # スタンプ選択
+        selected_stamp_idx = st.number_input("確認・編集するスタンプ番号", min_value=1, max_value=12, value=1) - 1
+        
+        # コマ範囲（トリミング）選択
+        frame_range = st.slider(
+            "使用するコマ（フレーム）範囲の切り出し",
+            min_value=1, max_value=max_raw_frames,
+            value=(1, max_raw_frames),
+            help="不要な最初の動きや最後の静止フレームをカットできます"
+        )
+        
+        # ループオプション
+        ping_pong = st.checkbox("🔄 往復再生（ピンポンループ）を有効にする", value=False, help="1➔2➔3➔2 のように動きを往復させて滑らかな無限ループを作成します")
+        trim_end = st.checkbox("✂️ ループ時の最後の重複コマを1枚カットする", value=True, help="ループ直前のカクつき・一瞬の停止を防ぎます")
+        
+        # 時間・ループ数
+        st.markdown("---")
+        target_sec = st.selectbox("総再生時間 (LINE規定: 1~4秒の整数秒)", [1, 2, 3, 4], index=1)
+        loop_count = st.selectbox("1スタンプあたりのループ回数", [1, 2, 3, 4], index=1)
+        
+        # コマ処理の適用
+        current_raw_frames = stamps_data[selected_stamp_idx]
+        edited_frames = process_frame_sequence(current_raw_frames, frame_range[0], frame_range[1], ping_pong, trim_end)
+        
+        # 1コマの表示時間計算
+        total_ms = target_sec * 1000
+        loop_ms = total_ms // loop_count
+        frame_duration_ms = max(50, loop_ms // len(edited_frames))
+        
+        st.info(f"💡 現在の構成: 全 **{len(edited_frames)}コマ** / 1コマ当たり **{frame_duration_ms}ms** / **{loop_count}回再生**で計 **{target_sec}秒**")
+        
+    with col_preview:
+        st.subheader("👁️ リアルタイムアニメーション")
+        # プレビューGIF生成＆表示
+        preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
+        st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} プレビュー", use_container_width=True)
+        
+    st.divider()
+    
+    # --- Step 3: 全スタンプ一括出力 ---
+    st.subheader("📦 編集した設定で全12個のスタンプを一括書き出し")
+    
+    if st.button("🚀 LINE審査適合APNGを一括ダウンロード (ZIP)"):
+        with st.spinner("12個のスタンプを設定に従って一括書き出し中..."):
             zip_buffer = io.BytesIO()
+            
+            # 各コマの表示時間リスト（ミリ秒誤差なし）
+            base_ms = loop_ms // len(edited_frames)
+            remainder = loop_ms % len(edited_frames)
+            durations_list = [base_ms] * len(edited_frames)
+            for i in range(remainder):
+                durations_list[i] += 1
+                
             with zipfile.ZipFile(zip_buffer, "w") as zip_file:
                 for idx in range(12):
-                    centered_frames = center_and_fit_stamp(raw_stamp_frames[idx], target_w=320, target_h=270)
-                    
-                    # 指定のループ数・コマ表示時間でAPNG化
-                    apng_data = optimize_apng_bytes(centered_frames, durations_list, loop_count)
+                    raw_f = stamps_data[idx]
+                    proc_f = process_frame_sequence(raw_f, frame_range[0], frame_range[1], ping_pong, trim_end)
+                    apng_data = optimize_apng_bytes(proc_f, durations_list, loop_count)
                     zip_file.writestr(f"stamp_{idx+1:02d}.png", apng_data)
                     
-            st.success(f"🎉 変換完了！【審査適合スペック】 総再生時間: {total_sec}秒 / ループ回数: {loop_count}回 / コマ数: {len(selected_frames)}コマ / 全ファイル1MB以下")
+            st.success("🎉 全12個のアニメーションスタンプの出力が完了しました！")
             
             st.download_button(
-                label="📦 LINE審査適合スタンプを一括ダウンロード (ZIP)",
+                label="📦 LINE審査適合スタンプ一括ダウンロード (ZIP)",
                 data=zip_buffer.getvalue(),
                 file_name="line_animation_stamps.zip",
                 mime="application/zip"
