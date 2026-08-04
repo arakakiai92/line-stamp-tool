@@ -10,26 +10,26 @@ import tempfile
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="centered")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("動画解析後、プレビューを見ながら「コマ削除」「往復再生」「速度調整」を自由に行い、LINE審査ガイドライン適合APNGを一括出力できます。")
+st.caption("動画解析後、プレビューを見ながら「透過の強さ（影消し）」「コマ削除」「往復再生」「速度調整」を自由に行い、LINE審査ガイドライン適合APNGを一括出力できます。")
 
 # セッション状態の初期化
-if 'processed_stamps' not in st.session_state:
-    st.session_state['processed_stamps'] = None
+if 'raw_stamps' not in st.session_state:
+    st.session_state['raw_stamps'] = None
 if 'fps' not in st.session_state:
     st.session_state['fps'] = 10
 
 ROWS = 3
 COLS = 4
 
-def remove_background_floodfill(cell_bgr, tolerance=40):
-    """キャラ内部の白を保護しながら背景のみ透過"""
+def remove_background_floodfill_outer(cell_bgr, tolerance=70):
+    """外枠からの塗りつぶしで背景や足元の影を自動透過（キャラ内部の白は完全保護）"""
     h, w, _ = cell_bgr.shape
     mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
     img_work = cell_bgr.copy()
     bg_color = cell_bgr[0, 0].astype(np.float32)
     
     seeds = []
-    step = 10
+    step = 5
     for x in range(0, w, step):
         seeds.append((x, 0))
         seeds.append((x, h - 1))
@@ -45,7 +45,7 @@ def remove_background_floodfill(cell_bgr, tolerance=40):
         if mask[seed_y + 1, seed_x + 1] == 0:
             pixel_color = cell_bgr[seed_y, seed_x].astype(np.float32)
             color_dist = np.linalg.norm(pixel_color - bg_color)
-            if color_dist <= tolerance * 1.5:
+            if color_dist <= tolerance * 2.0:
                 cv2.floodFill(img_work, mask, seedPoint=(seed_x, seed_y), newVal=(0, 0, 0),
                               loDiff=lo_diff, upDiff=up_diff, flags=flags)
             
@@ -160,7 +160,7 @@ uploaded_file = st.file_uploader("1. 動画ファイル (MP4 / MOV) をアップ
 
 if uploaded_file is not None:
     if st.button("🔍 動画を解析して編集画面へ進む"):
-        with st.spinner("動画のコマ分割・透過・センタリング処理中..."):
+        with st.spinner("動画のコマ分割処理中..."):
             try:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
                     uploaded_file.seek(0)
@@ -192,35 +192,43 @@ if uploaded_file is not None:
                             for c in range(COLS):
                                 idx = r * COLS + c
                                 cell = frame[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w]
-                                transparent_cell = remove_background_floodfill(cell)
-                                raw_stamps[idx].append(transparent_cell)
+                                raw_stamps[idx].append(cell)
                                 
-                    centered_stamps = {}
-                    for idx in range(12):
-                        centered_stamps[idx] = center_and_fit_stamp(raw_stamps[idx])
-                        
-                    st.session_state['processed_stamps'] = centered_stamps
-                    st.success("解析が完了しました！下部の編集エリアで調整を行ってください。")
+                    st.session_state['raw_stamps'] = raw_stamps
+                    st.success("解析が完了しました！下部の編集エリアで透過調整を行ってください。")
                 else:
                     st.error("動画フレームの読み込みに失敗しました。正しい動画ファイルかご確認ください。")
             except Exception as e:
                 st.error(f"解析中にエラーが発生しました: {e}")
 
 # --- Step 2: プレビュー ＆ 高度編集エリア ---
-if st.session_state['processed_stamps'] is not None:
+if st.session_state['raw_stamps'] is not None:
     st.divider()
     st.header("🎛️ スタンプ編集 ＆ リアルタイムプレビュー")
     
-    stamps_data = st.session_state['processed_stamps']
-    max_raw_frames = max(1, len(stamps_data.get(0, [])))
+    raw_stamps_data = st.session_state['raw_stamps']
+    max_raw_frames = max(1, len(raw_stamps_data.get(0, [])))
     
     col_preview, col_controls = st.columns([1, 1.2])
     
     with col_controls:
         st.subheader("🛠️ 編集コントロール")
         
+        # スタンプ選択
         selected_stamp_idx = st.number_input("確認・編集するスタンプ番号 (1〜12)", min_value=1, max_value=12, value=1) - 1
         
+        # 透過感度スライダー (影消し・ノイズ除去)
+        st.markdown("---")
+        st.markdown("##### 🎨 透過の強さ（感度・影消し）")
+        tolerance = st.slider(
+            "透過の強さ（しきい値）",
+            min_value=10, max_value=150, value=75, step=5,
+            help="数値を上げると足元の影や周りの薄いグレー・ノイズがきれいに消えます。"
+        )
+        
+        # コマ範囲（トリミング）選択
+        st.markdown("---")
+        st.markdown("##### ✂️ コマ（フレーム）編集")
         if max_raw_frames > 1:
             frame_range = st.slider(
                 "使用するコマ（フレーム）範囲の切り出し",
@@ -234,12 +242,18 @@ if st.session_state['processed_stamps'] is not None:
         ping_pong = st.checkbox("🔄 往復再生（ピンポンループ）を有効にする", value=False, help="1➔2➔3➔2 のように動きを往復させて滑らかな無限ループを作成します")
         trim_end = st.checkbox("✂️ ループ時の最後の重複コマを1枚カットする", value=True, help="ループ直前のカクつき・一瞬の停止を防ぎます")
         
+        # 時間・ループ数
         st.markdown("---")
+        st.markdown("##### ⏱️ 再生時間・ループ設定")
         target_sec = st.selectbox("総再生時間 (LINE規定: 1~4秒の整数秒)", [1, 2, 3, 4], index=1)
         loop_count = st.selectbox("1スタンプあたりのループ回数", [1, 2, 3, 4], index=1)
         
-        current_raw_frames = stamps_data.get(selected_stamp_idx, stamps_data.get(0, []))
-        edited_frames = process_frame_sequence(current_raw_frames, frame_range[0], frame_range[1], ping_pong, trim_end)
+        # 選択されたスタンプセルに対して、現在の感度でリアルタイム背景透過＋センタリング適用
+        current_raw_cells = raw_stamps_data.get(selected_stamp_idx, raw_stamps_data.get(0, []))
+        current_transparent_frames = [remove_background_floodfill_outer(cell, tolerance=tolerance) for cell in current_raw_cells]
+        current_centered_frames = center_and_fit_stamp(current_transparent_frames)
+        
+        edited_frames = process_frame_sequence(current_centered_frames, frame_range[0], frame_range[1], ping_pong, trim_end)
         
         total_ms = target_sec * 1000
         loop_ms = total_ms // loop_count
@@ -251,7 +265,7 @@ if st.session_state['processed_stamps'] is not None:
     with col_preview:
         st.subheader("👁️ リアルタイムアニメーション")
         preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
-        st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} プレビュー")
+        st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} プレビュー (透過感度: {tolerance})")
         
     st.divider()
     
@@ -262,6 +276,7 @@ if st.session_state['processed_stamps'] is not None:
         with st.spinner("12個のスタンプを設定に従って一括書き出し中..."):
             try:
                 zip_buffer = io.BytesIO()
+                
                 frame_cnt = max(1, len(edited_frames))
                 base_ms = loop_ms // frame_cnt
                 remainder = loop_ms % frame_cnt
@@ -271,8 +286,11 @@ if st.session_state['processed_stamps'] is not None:
                     
                 with zipfile.ZipFile(zip_buffer, "w") as zip_file:
                     for idx in range(12):
-                        raw_f = stamps_data.get(idx, [])
-                        proc_f = process_frame_sequence(raw_f, frame_range[0], frame_range[1], ping_pong, trim_end)
+                        raw_cells = raw_stamps_data.get(idx, [])
+                        trans_frames = [remove_background_floodfill_outer(c, tolerance=tolerance) for c in raw_cells]
+                        cent_frames = center_and_fit_stamp(trans_frames)
+                        proc_f = process_frame_sequence(cent_frames, frame_range[0], frame_range[1], ping_pong, trim_end)
+                        
                         apng_data = optimize_apng_bytes(proc_f, durations_list, loop_count)
                         zip_file.writestr(f"stamp_{idx+1:02d}.png", apng_data)
                         
