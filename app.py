@@ -10,7 +10,7 @@ import tempfile
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="centered")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("動画解析後、プレビューを見ながら「透過の強さ（影消し）」「コマ数（5〜20コマ制限）」「往復再生」「速度調整」を自由に行い、LINE審査ガイドライン適合APNGを一括出力できます。")
+st.caption("動画解析後、プレビューを見ながら「透過の強さ（影消し）」「コマ数（5〜20コマ制限）」「往復再生」「速度調整」を自由に行い、個別保存または一括ZIPダウンロードできます。")
 
 if 'raw_stamps' not in st.session_state:
     st.session_state['raw_stamps'] = None
@@ -114,7 +114,6 @@ def process_frame_sequence_strict(frames, start_frame, end_frame, target_frame_c
         reverse_part = sub[-2:0:-1]
         sub = sub + reverse_part
         
-    # 5〜20コマに厳格にリサンプリング
     target_count = max(5, min(20, target_frame_count))
     if len(sub) != target_count:
         indices = np.linspace(0, len(sub) - 1, target_count, dtype=int)
@@ -231,7 +230,6 @@ if st.session_state['raw_stamps'] is not None:
         st.markdown("---")
         st.markdown("##### 🎞️ 出力コマ数・アニメーション切り出し（LINE規格: 5〜20コマ）")
         
-        # 1. 最終出力コマ数指定スライダー（厳密に5〜20に制限）
         default_target_count = min(20, max(5, max_raw_frames))
         target_frame_count = st.slider(
             "出力コマ数 (LINE規定: 5〜20コマ厳守)",
@@ -239,7 +237,6 @@ if st.session_state['raw_stamps'] is not None:
             help="LINEスタンプ規約に従い、出力されるAPNGの枚数を5〜20コマの範囲で指定します。"
         )
         
-        # 2. 動画の範囲切り出し
         if max_raw_frames > 1:
             frame_range = st.slider(
                 "元動画の使用範囲（開始コマ 〜 終了コマ）",
@@ -264,7 +261,6 @@ if st.session_state['raw_stamps'] is not None:
         current_transparent_frames = [remove_background_floodfill_outer(cell, tolerance=tolerance) for cell in current_raw_cells]
         current_centered_frames = center_and_fit_stamp(current_transparent_frames)
         
-        # 厳密に5〜20コマに収める処理を実行
         edited_frames = process_frame_sequence_strict(
             current_centered_frames, frame_range[0], frame_range[1],
             target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
@@ -275,12 +271,28 @@ if st.session_state['raw_stamps'] is not None:
         frame_cnt = len(edited_frames)
         frame_duration_ms = max(50, loop_ms // frame_cnt)
         
+        base_ms = loop_ms // frame_cnt
+        remainder = loop_ms % frame_cnt
+        durations_list = [base_ms] * frame_cnt
+        for i in range(remainder):
+            durations_list[i] += 1
+            
         st.success(f"✅ LINE規約適合: **全{frame_cnt}コマ** （規定範囲: 5〜20コマ内） / 1コマ当たり **{frame_duration_ms}ms** / **{loop_count}回再生**で計 **{target_sec}秒**")
         
     with col_preview:
         st.subheader("👁️ リアルタイムアニメーション")
         preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
         st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} プレビュー (出力: {frame_cnt}コマ)")
+        
+        # --- 個別保存ボタン ---
+        single_apng_data = optimize_apng_bytes(edited_frames, durations_list, loop_count)
+        st.download_button(
+            label=f"💾 スタンプ #{selected_stamp_idx + 1} を個別ダウンロード (APNG)",
+            data=single_apng_data,
+            file_name=f"stamp_{selected_stamp_idx+1:02d}.png",
+            mime="image/png",
+            help="現在プレビュー表示されているスタンプだけをAPNG形式でダウンロードします"
+        )
         
     st.divider()
     
@@ -292,13 +304,6 @@ if st.session_state['raw_stamps'] is not None:
             try:
                 zip_buffer = io.BytesIO()
                 
-                frame_cnt = len(edited_frames)
-                base_ms = loop_ms // frame_cnt
-                remainder = loop_ms % frame_cnt
-                durations_list = [base_ms] * frame_cnt
-                for i in range(remainder):
-                    durations_list[i] += 1
-                    
                 with zipfile.ZipFile(zip_buffer, "w") as zip_file:
                     for idx in range(12):
                         raw_cells = raw_stamps_data.get(idx, [])
