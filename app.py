@@ -5,6 +5,7 @@ from PIL import Image
 import io
 import zipfile
 import os
+import tempfile
 
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="centered")
 
@@ -116,7 +117,6 @@ def process_frame_sequence(frames, start_frame, end_frame, ping_pong=False, trim
         indices = np.linspace(0, len(sub) - 1, 20, dtype=int)
         sub = [sub[i] for i in indices]
     elif len(sub) < 5:
-        # 5コマ未満の場合は5コマまで補完
         while len(sub) < 5:
             sub.append(sub[-1])
             
@@ -124,6 +124,8 @@ def process_frame_sequence(frames, start_frame, end_frame, ping_pong=False, trim
 
 def create_preview_gif(frame_list, duration_ms):
     """プレビュー用Web GIF作成"""
+    if not frame_list:
+        return b""
     buf = io.BytesIO()
     frame_list[0].save(
         buf, format="GIF", save_all=True,
@@ -160,9 +162,10 @@ uploaded_file = st.file_uploader("1. 動画ファイル (MP4 / MOV) をアップ
 if uploaded_file is not None:
     if st.button("🔍 動画を解析して編集画面へ進む"):
         with st.spinner("動画のコマ分割・透過・センタリング処理中..."):
-            temp_path = "temp_input.mp4"
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.read())
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
+                uploaded_file.seek(0)
+                tfile.write(uploaded_file.read())
+                temp_path = tfile.name
                 
             cap = cv2.VideoCapture(temp_path)
             fps = cap.get(cv2.CAP_PROP_FPS) or 10
@@ -199,6 +202,8 @@ if uploaded_file is not None:
                     
                 st.session_state['processed_stamps'] = centered_stamps
                 st.success("解析が完了しました！下部の編集エリアで調整を行ってください。")
+            else:
+                st.error("動画フレームの読み込みに失敗しました。正しい動画ファイルかご確認ください。")
 
 # --- Step 2: プレビュー ＆ 高度編集エリア ---
 if st.session_state['processed_stamps'] is not None:
@@ -206,7 +211,7 @@ if st.session_state['processed_stamps'] is not None:
     st.header("🎛️ スタンプ編集 ＆ リアルタイムプレビュー")
     
     stamps_data = st.session_state['processed_stamps']
-    max_raw_frames = len(stamps_data[0])
+    max_raw_frames = len(stamps_data[0]) if stamps_data else 10
     
     col_preview, col_controls = st.columns([1, 1.2])
     
@@ -214,15 +219,18 @@ if st.session_state['processed_stamps'] is not None:
         st.subheader("🛠️ 編集コントロール")
         
         # スタンプ選択
-        selected_stamp_idx = st.number_input("確認・編集するスタンプ番号", min_value=1, max_value=12, value=1) - 1
+        selected_stamp_idx = st.number_input("確認・編集するスタンプ番号 (1〜12)", min_value=1, max_value=12, value=1) - 1
         
         # コマ範囲（トリミング）選択
-        frame_range = st.slider(
-            "使用するコマ（フレーム）範囲の切り出し",
-            min_value=1, max_value=max_raw_frames,
-            value=(1, max_raw_frames),
-            help="不要な最初の動きや最後の静止フレームをカットできます"
-        )
+        if max_raw_frames > 1:
+            frame_range = st.slider(
+                "使用するコマ（フレーム）範囲の切り出し",
+                min_value=1, max_value=max_raw_frames,
+                value=(1, max_raw_frames),
+                help="不要な最初の動きや最後の静止フレームをカットできます"
+            )
+        else:
+            frame_range = (1, 1)
         
         # ループオプション
         ping_pong = st.checkbox("🔄 往復再生（ピンポンループ）を有効にする", value=False, help="1➔2➔3➔2 のように動きを往復させて滑らかな無限ループを作成します")
@@ -234,13 +242,14 @@ if st.session_state['processed_stamps'] is not None:
         loop_count = st.selectbox("1スタンプあたりのループ回数", [1, 2, 3, 4], index=1)
         
         # コマ処理の適用
-        current_raw_frames = stamps_data[selected_stamp_idx]
+        current_raw_frames = stamps_data.get(selected_stamp_idx, stamps_data[0])
         edited_frames = process_frame_sequence(current_raw_frames, frame_range[0], frame_range[1], ping_pong, trim_end)
         
         # 1コマの表示時間計算
         total_ms = target_sec * 1000
         loop_ms = total_ms // loop_count
-        frame_duration_ms = max(50, loop_ms // len(edited_frames))
+        frame_cnt = max(1, len(edited_frames))
+        frame_duration_ms = max(50, loop_ms // frame_cnt)
         
         st.info(f"💡 現在の構成: 全 **{len(edited_frames)}コマ** / 1コマ当たり **{frame_duration_ms}ms** / **{loop_count}回再生**で計 **{target_sec}秒**")
         
@@ -248,7 +257,7 @@ if st.session_state['processed_stamps'] is not None:
         st.subheader("👁️ リアルタイムアニメーション")
         # プレビューGIF生成＆表示
         preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
-        st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} プレビュー", use_container_width=True)
+        st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} プレビュー", use_column_width=True)
         
     st.divider()
     
@@ -260,9 +269,10 @@ if st.session_state['processed_stamps'] is not None:
             zip_buffer = io.BytesIO()
             
             # 各コマの表示時間リスト（ミリ秒誤差なし）
-            base_ms = loop_ms // len(edited_frames)
-            remainder = loop_ms % len(edited_frames)
-            durations_list = [base_ms] * len(edited_frames)
+            frame_cnt = max(1, len(edited_frames))
+            base_ms = loop_ms // frame_cnt
+            remainder = loop_ms % frame_cnt
+            durations_list = [base_ms] * frame_cnt
             for i in range(remainder):
                 durations_list[i] += 1
                 
