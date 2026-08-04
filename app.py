@@ -9,28 +9,48 @@ import os
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成", layout="centered")
 
 st.title("⚡ LINEアニメーションスタンプ自動生成ツール")
-st.caption("白背景を自動で透過し、LINEの審査ガイドライン（20コマ以内 / 1〜4秒の整数秒 / 1MB以下）に一括適合させます。")
+st.caption("背景色を自動取得し、高度な画像処理（境界平滑化）でノイズを除去して透過します。LINEの審査ガイドライン（20コマ以内 / 1〜4秒の整数秒 / 1MB以下）に適合させます。")
 
 uploaded_file = st.file_uploader("動画ファイル (MP4 / MOV) を選択してください", type=["mp4", "mov"])
 
 ROWS = 3
 COLS = 4
 
-def remove_white_background(pil_img, threshold=240):
-    """白背景を高速で透明化する関数"""
-    img = pil_img.convert("RGBA")
-    data = np.array(img)
+def remove_background_cv(cell_bgr):
+    """OpenCVを使用して、背景色を自動取得し、距離に基づいて透過処理と平滑化を行う関数"""
+    # 1. 背景色の自動取得（最左上ピクセルの色を背景色と仮定）
+    # cell_bgr はBGR形式
+    bg_color = cell_bgr[0, 0]
     
-    r, g, b, a = data[:, :, 0], data[:, :, 1], data[:, :, 2], data[:, :, 3]
-    # RGBがすべて240以上の明るい（白っぽい）部分を透明化
-    white_areas = (r >= threshold) & (g >= threshold) & (b >= threshold)
-    data[white_areas, 3] = 0
+    # 2. ユークリッド距離の計算（全ピクセルと背景色）
+    # 動画圧縮による微小な色ムラも許容する
+    diff = cell_bgr.astype(np.float32) - bg_color.astype(np.float32)
+    dist = np.sqrt(np.sum(diff**2, axis=2))
     
-    return Image.fromarray(data)
+    # 3. アルファチャンネルの作成（距離が閾値以下のピクセルを透明にする）
+    # image_3.pngのようなノイズを消すため、閾値を少し甘く設定
+    threshold = 50 
+    alpha = np.where(dist < threshold, 0, 255).astype(np.uint8)
+    
+    # 4. アルファチャンネルの平滑化（ノイズ除去と境界をきれいに丸め込む）
+    # ガウシアンブラーで境界をぼかす
+    alpha_blurred = cv2.GaussianBlur(alpha, (5, 5), 0)
+    # 再度閾値処理（二値化）を行い、境界を丸め込み、ガタついた白いピクセルの残りを消す
+    # 127より大きいものを255（白）、小さいものを0（透明）に。
+    _, alpha_smoothed = cv2.threshold(alpha_blurred, 127, 255, cv2.THRESH_BINARY)
+    
+    # 5. BGRA画像の合成
+    b, g, r = cv2.split(cell_bgr)
+    cell_bgra = cv2.merge([b, g, r, alpha_smoothed])
+    
+    # 6. PIL用にRGBAへ変換
+    cell_rgba = cv2.cvtColor(cell_bgra, cv2.COLOR_BGRA2RGBA)
+    
+    return cell_rgba
 
 def optimize_apng_bytes(img_list, duration_ms):
     """LINEの1MB制限に安全に適合させてAPNG化する関数"""
-    # 1. 標準のRGBAモードでAPNG生成（320x270px以下の透過画像なら基本的に1MB以下になります）
+    # 1. 標準のRGBAモードでAPNG生成
     buf = io.BytesIO()
     img_list[0].save(
         buf,
@@ -51,7 +71,7 @@ def optimize_apng_bytes(img_list, duration_ms):
     for colors in colors_list:
         quantized_imgs = []
         for img in img_list:
-            # 減色後にRGBAへ戻すことでエラー（PAモード化）を防止
+            # 減色後にRGBAへ戻すことでエラー防止
             q_img = img.quantize(colors=colors, method=Image.Quantize.FASTOCTREE).convert("RGBA")
             quantized_imgs.append(q_img)
             
@@ -72,7 +92,7 @@ def optimize_apng_bytes(img_list, duration_ms):
 
 if uploaded_file is not None:
     if st.button("🚀 審査適合スタンプを一括変換"):
-        st.info("動画を処理中...")
+        st.info("動画を解析し、高度な画像処理で透過・ノイズ除去中です。少し時間がかかります...")
         
         temp_path = "temp_input.mp4"
         with open(temp_path, "wb") as f:
@@ -86,8 +106,7 @@ if uploaded_file is not None:
             ret, frame = cap.read()
             if not ret:
                 break
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(frame_rgb)
+            frames.append(frame) # OpenCVのBGR形式のまま保持
         cap.release()
         
         if os.path.exists(temp_path):
@@ -113,7 +132,7 @@ if uploaded_file is not None:
             target_sec = max(1, min(4, round(raw_duration_sec)))
             frame_duration_ms = int((target_sec * 1000) / len(selected_frames))
             
-            # 3. グリッド切出 ＆ 高速白透過処理
+            # 3. グリッド切出 ＆ 高度背景透過処理（OpenCV）
             h, w, _ = selected_frames[0].shape
             cell_h = h // ROWS
             cell_w = w // COLS
@@ -125,10 +144,15 @@ if uploaded_file is not None:
                 for r in range(ROWS):
                     for c in range(COLS):
                         idx = r * COLS + c
+                        # OpenCV形式（BGR）で切り出す
                         cell = frame[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w]
                         
-                        pil_cell = Image.fromarray(cell)
-                        transparent_cell = remove_white_background(pil_cell)
+                        # OpenCVを使用して背景色自動取得、透過、境界平滑化
+                        transparent_cell_rgba_array = remove_background_cv(cell)
+                        # PIL画像（RGBAモード）に変換
+                        transparent_cell = Image.fromarray(transparent_cell_rgba_array)
+                        
+                        # LINE規格の最大サイズにリサイズ
                         transparent_cell.thumbnail((320, 270), Image.Resampling.LANCZOS)
                         
                         stamp_frames[idx].append(transparent_cell)
@@ -140,10 +164,11 @@ if uploaded_file is not None:
             with zipfile.ZipFile(zip_buffer, "w") as zip_file:
                 for idx in range(12):
                     img_list = stamp_frames[idx]
+                    # 安全なAPNG形式（1MB以下）で出力
                     apng_data = optimize_apng_bytes(img_list, frame_duration_ms)
                     zip_file.writestr(f"stamp_{idx+1:02d}.png", apng_data)
                     
-            st.success(f"🎉 変換完了！ 再生時間: {target_sec}秒 / {len(selected_frames)}コマ / 全ファイル1MB以下に適合")
+            st.success(f"🎉 変換完了！ 再生時間: {target_sec}秒 / {len(selected_frames)}コマ / 全ファイル1MB以下。境界も滑らかになりました。")
             
             st.download_button(
                 label="📦 LINE審査適合スタンプを一括ダウンロード (ZIP)",
