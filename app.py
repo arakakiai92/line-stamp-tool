@@ -10,9 +10,8 @@ import tempfile
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="centered")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("動画解析後、プレビューを見ながら「透過の強さ（影消し）」「コマ削除」「往復再生」「速度調整」を自由に行い、LINE審査ガイドライン適合APNGを一括出力できます。")
+st.caption("動画解析後、プレビューを見ながら「透過の強さ（影消し）」「コマ数（5〜20コマ制限）」「往復再生」「速度調整」を自由に行い、LINE審査ガイドライン適合APNGを一括出力できます。")
 
-# セッション状態の初期化
 if 'raw_stamps' not in st.session_state:
     st.session_state['raw_stamps'] = None
 if 'fps' not in st.session_state:
@@ -99,11 +98,14 @@ def center_and_fit_stamp(frame_list, target_w=320, target_h=270, padding=12):
         
     return centered_frames
 
-def process_frame_sequence(frames, start_frame, end_frame, ping_pong=False, trim_end=False):
-    """コマの選択・トリミング・往復再生・重複削除処理"""
+def process_frame_sequence_strict(frames, start_frame, end_frame, target_frame_count=15, ping_pong=False, trim_end=False):
+    """
+    コマの選択・トリミング・往復再生・重複削除を行った上で、
+    LINE規格の【5〜20コマ以内】に厳密に収める関数
+    """
     sub = frames[start_frame - 1 : end_frame]
     if not sub:
-        return frames
+        sub = frames
         
     if trim_end and len(sub) > 2:
         sub = sub[:-1]
@@ -112,13 +114,12 @@ def process_frame_sequence(frames, start_frame, end_frame, ping_pong=False, trim
         reverse_part = sub[-2:0:-1]
         sub = sub + reverse_part
         
-    if len(sub) > 20:
-        indices = np.linspace(0, len(sub) - 1, 20, dtype=int)
+    # 5〜20コマに厳格にリサンプリング
+    target_count = max(5, min(20, target_frame_count))
+    if len(sub) != target_count:
+        indices = np.linspace(0, len(sub) - 1, target_count, dtype=int)
         sub = [sub[i] for i in indices]
-    elif len(sub) < 5:
-        while len(sub) < 5:
-            sub.append(sub[-1])
-            
+        
     return sub
 
 def create_preview_gif(frame_list, duration_ms):
@@ -195,7 +196,7 @@ if uploaded_file is not None:
                                 raw_stamps[idx].append(cell)
                                 
                     st.session_state['raw_stamps'] = raw_stamps
-                    st.success("解析が完了しました！下部の編集エリアで透過調整を行ってください。")
+                    st.success("解析が完了しました！下部の編集エリアでコマ数・透過調整を行ってください。")
                 else:
                     st.error("動画フレームの読み込みに失敗しました。正しい動画ファイルかご確認ください。")
             except Exception as e:
@@ -226,15 +227,25 @@ if st.session_state['raw_stamps'] is not None:
             help="数値を上げると足元の影や周りの薄いグレー・ノイズがきれいに消えます。"
         )
         
-        # コマ範囲（トリミング）選択
+        # コマ範囲 ＆ 出力コマ数（LINE規格5〜20コマ厳守）スライダー
         st.markdown("---")
-        st.markdown("##### ✂️ コマ（フレーム）編集")
+        st.markdown("##### 🎞️ 出力コマ数・アニメーション切り出し（LINE規格: 5〜20コマ）")
+        
+        # 1. 最終出力コマ数指定スライダー（厳密に5〜20に制限）
+        default_target_count = min(20, max(5, max_raw_frames))
+        target_frame_count = st.slider(
+            "出力コマ数 (LINE規定: 5〜20コマ厳守)",
+            min_value=5, max_value=20, value=default_target_count, step=1,
+            help="LINEスタンプ規約に従い、出力されるAPNGの枚数を5〜20コマの範囲で指定します。"
+        )
+        
+        # 2. 動画の範囲切り出し
         if max_raw_frames > 1:
             frame_range = st.slider(
-                "使用するコマ（フレーム）範囲の切り出し",
+                "元動画の使用範囲（開始コマ 〜 終了コマ）",
                 min_value=1, max_value=max_raw_frames,
                 value=(1, max_raw_frames),
-                help="不要な最初の動きや最後の静止フレームをカットできます"
+                help="動画内の使用したい区間を指定できます。"
             )
         else:
             frame_range = (1, 1)
@@ -253,19 +264,23 @@ if st.session_state['raw_stamps'] is not None:
         current_transparent_frames = [remove_background_floodfill_outer(cell, tolerance=tolerance) for cell in current_raw_cells]
         current_centered_frames = center_and_fit_stamp(current_transparent_frames)
         
-        edited_frames = process_frame_sequence(current_centered_frames, frame_range[0], frame_range[1], ping_pong, trim_end)
+        # 厳密に5〜20コマに収める処理を実行
+        edited_frames = process_frame_sequence_strict(
+            current_centered_frames, frame_range[0], frame_range[1],
+            target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
+        )
         
         total_ms = target_sec * 1000
         loop_ms = total_ms // loop_count
-        frame_cnt = max(1, len(edited_frames))
+        frame_cnt = len(edited_frames)
         frame_duration_ms = max(50, loop_ms // frame_cnt)
         
-        st.info(f"💡 現在の構成: 全 **{len(edited_frames)}コマ** / 1コマ当たり **{frame_duration_ms}ms** / **{loop_count}回再生**で計 **{target_sec}秒**")
+        st.success(f"✅ LINE規約適合: **全{frame_cnt}コマ** （規定範囲: 5〜20コマ内） / 1コマ当たり **{frame_duration_ms}ms** / **{loop_count}回再生**で計 **{target_sec}秒**")
         
     with col_preview:
         st.subheader("👁️ リアルタイムアニメーション")
         preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
-        st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} プレビュー (透過感度: {tolerance})")
+        st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} プレビュー (出力: {frame_cnt}コマ)")
         
     st.divider()
     
@@ -277,7 +292,7 @@ if st.session_state['raw_stamps'] is not None:
             try:
                 zip_buffer = io.BytesIO()
                 
-                frame_cnt = max(1, len(edited_frames))
+                frame_cnt = len(edited_frames)
                 base_ms = loop_ms // frame_cnt
                 remainder = loop_ms % frame_cnt
                 durations_list = [base_ms] * frame_cnt
@@ -289,7 +304,10 @@ if st.session_state['raw_stamps'] is not None:
                         raw_cells = raw_stamps_data.get(idx, [])
                         trans_frames = [remove_background_floodfill_outer(c, tolerance=tolerance) for c in raw_cells]
                         cent_frames = center_and_fit_stamp(trans_frames)
-                        proc_f = process_frame_sequence(cent_frames, frame_range[0], frame_range[1], ping_pong, trim_end)
+                        proc_f = process_frame_sequence_strict(
+                            cent_frames, frame_range[0], frame_range[1],
+                            target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
+                        )
                         
                         apng_data = optimize_apng_bytes(proc_f, durations_list, loop_count)
                         zip_file.writestr(f"stamp_{idx+1:02d}.png", apng_data)
