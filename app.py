@@ -6,12 +6,26 @@ import io
 import zipfile
 import os
 
-st.set_page_config(page_title="LINEアニメーションスタンプ自動生成", layout="centered")
+st.set_page_config(page_title="LINEアニメーションスタンプ自動生成（ガイドライン厳守版）", layout="centered")
 
-st.title("⚡ LINEアニメーションスタンプ自動生成ツール")
-st.caption("自動背景透過・キャラクター自動認識＆センタリング配置・LINE審査ガイドライン適合（20コマ以内 / 1〜4秒の整数秒 / 1MB以下）をすべて一括で行います。")
+st.title("⚡ LINEアニメーションスタンプ自動生成")
+st.caption("LINE審査ガイドライン（フレーム数5~20 / 再生時間1~4秒の整数秒 / ループ数1~4回 / 1MB以下 / 背景透過 / センタリング）に100%自動適合させます。")
 
 uploaded_file = st.file_uploader("動画ファイル (MP4 / MOV) を選択してください", type=["mp4", "mov"])
+
+# ループ・秒数の設定モード
+st.subheader("⚙️ アニメーション再生設定")
+mode = st.radio("設定モードを選択してください", ["🤖 自動最適化 (動画の長さに合わせてLINE規約に最適設定)", "⚙️ 手動指定 (再生時間とループ数を自分で指定)"])
+
+manual_target_sec = 2
+manual_loop_count = 2
+
+if "手動指定" in mode:
+    col1, col2 = st.columns(2)
+    with col1:
+        manual_target_sec = st.selectbox("総再生時間 (整数秒)", [1, 2, 3, 4], index=1, help="スタンプの全体の長さです（最大4秒）")
+    with col2:
+        manual_loop_count = st.selectbox("ループ回数", [1, 2, 3, 4], index=1, help="1スタンプあたりの繰り返し回数です")
 
 ROWS = 3
 COLS = 4
@@ -64,14 +78,10 @@ def remove_background_floodfill(cell_bgr, tolerance=40):
     return Image.fromarray(cell_rgba)
 
 def center_and_fit_stamp(frame_list, target_w=320, target_h=270, padding=12):
-    """
-    全コマ共通でキャラクターの表示領域を自動認識し、
-    動きのガタつきを防ぎながら320x270キャンバスの中央にぴったり配置する関数
-    """
+    """キャラクターを認識して中央寄せセンタリング配置する関数"""
     if not frame_list:
         return frame_list
         
-    # 全コマの透過情報を重ね合わせてアニメーション全体の最大領域を検出
     alphas = [np.array(img)[:, :, 3] for img in frame_list]
     stacked_alpha = np.maximum.reduce(alphas)
     
@@ -82,7 +92,6 @@ def center_and_fit_stamp(frame_list, target_w=320, target_h=270, padding=12):
     min_y, min_x = non_zeros.min(axis=0)
     max_y, max_x = non_zeros.max(axis=0)
     
-    # 認識領域に余白（Padding）を追加
     h_orig, w_orig = stacked_alpha.shape
     min_x = max(0, min_x - padding)
     min_y = max(0, min_y - padding)
@@ -92,12 +101,10 @@ def center_and_fit_stamp(frame_list, target_w=320, target_h=270, padding=12):
     crop_w = max_x - min_x + 1
     crop_h = max_y - min_y + 1
     
-    # 320x270に最適フィットする倍率を計算
     scale = min(target_w / crop_w, target_h / crop_h)
     new_w = max(1, int(round(crop_w * scale)))
     new_h = max(1, int(round(crop_h * scale)))
     
-    # キャンバス中央配置の計算
     offset_x = (target_w - new_w) // 2
     offset_y = (target_h - new_h) // 2
     
@@ -112,16 +119,66 @@ def center_and_fit_stamp(frame_list, target_w=320, target_h=270, padding=12):
         
     return centered_frames
 
-def optimize_apng_bytes(img_list, duration_ms):
-    """LINEの1MB制限に安全に適合させてAPNG化する関数"""
+def calculate_line_animation_timing(raw_duration_sec, num_frames, is_auto, user_sec=2, user_loop=2):
+    """LINEの厳格な「整数秒」「ループ数1~4」規約にミリ秒単位でぴったり合わせる計算関数"""
+    if not is_auto:
+        total_sec = user_sec
+        loop_count = user_loop
+        loop_target_ms = (total_sec * 1000) // loop_count
+    else:
+        candidates = []
+        for total_target_sec in [1, 2, 3, 4]:
+            for loop_count in [1, 2, 3, 4]:
+                total_target_ms = total_target_sec * 1000
+                if total_target_ms % loop_count != 0:
+                    continue
+                loop_target_ms = total_target_ms // loop_count
+                avg_frame_ms = loop_target_ms / num_frames
+                
+                if avg_frame_ms < 50 or avg_frame_ms > 500:
+                    continue
+                    
+                loop_sec = loop_target_ms / 1000.0
+                speed_ratio = loop_sec / raw_duration_sec if raw_duration_sec > 0 else 1.0
+                speed_penalty = abs(speed_ratio - 1.0)
+                duration_preference = -0.05 * total_target_sec
+                score = speed_penalty + duration_preference
+                
+                candidates.append({
+                    'loop_count': loop_count,
+                    'total_sec': total_target_sec,
+                    'loop_ms': loop_target_ms,
+                    'score': score
+                })
+                
+        if not candidates:
+            total_sec, loop_count, loop_target_ms = 2, 2, 1000
+        else:
+            candidates.sort(key=lambda x: x['score'])
+            best = candidates[0]
+            total_sec = best['total_sec']
+            loop_count = best['loop_count']
+            loop_target_ms = best['loop_ms']
+
+    # 1コマあたりの表示時間を分配（合計が正確に1ループのミリ秒になるよう補正）
+    base_ms = loop_target_ms // num_frames
+    remainder = loop_target_ms % num_frames
+    durations = [base_ms] * num_frames
+    for i in range(remainder):
+        durations[i] += 1
+        
+    return loop_count, total_sec, durations
+
+def optimize_apng_bytes(img_list, durations, loop_count):
+    """指定されたループ回数とコマ表示時間で1MB以下に抑えてAPNG保存する関数"""
     buf = io.BytesIO()
     img_list[0].save(
         buf,
         format="PNG",
         save_all=True,
         append_images=img_list[1:],
-        duration=duration_ms,
-        loop=0
+        duration=durations,
+        loop=loop_count  # LINE規定の1~4回のループ数を正しく指定
     )
     data = buf.getvalue()
     
@@ -141,8 +198,8 @@ def optimize_apng_bytes(img_list, duration_ms):
             format="PNG",
             save_all=True,
             append_images=quantized_imgs[1:],
-            duration=duration_ms,
-            loop=0
+            duration=durations,
+            loop=loop_count
         )
         data = buf.getvalue()
         if len(data) < 990000:
@@ -151,8 +208,8 @@ def optimize_apng_bytes(img_list, duration_ms):
     return data
 
 if uploaded_file is not None:
-    if st.button("🚀 センタリング・審査適合スタンプを一括変換"):
-        st.info("動画を解析し、キャラクター認識・センタリング・背景透過処理中です...")
+    if st.button("🚀 審査適合スタンプを一括生成"):
+        st.info("動画を解析し、LINEガイドライン適合処理（コマ数・再生時間・ループ数調整・透過・センタリング）を実行中です...")
         
         temp_path = "temp_input.mp4"
         with open(temp_path, "wb") as f:
@@ -175,24 +232,26 @@ if uploaded_file is not None:
         if not frames:
             st.error("動画の読み込みに失敗しました。")
         else:
-            # 1. コマ数補正（最大20コマ）
+            # 1. フレーム（コマ）数の調整（規約: 5～20フレーム）
             total_f = len(frames)
-            target_f_count = 20
-            if total_f > target_f_count:
-                indices = np.linspace(0, total_f - 1, target_f_count, dtype=int)
+            target_f_count = min(20, max(5, total_f))
+            if total_f > 20:
+                indices = np.linspace(0, total_f - 1, 20, dtype=int)
                 selected_frames = [frames[i] for i in indices]
             elif total_f < 5:
-                st.error("動画のコマ数が短すぎます（最低5コマ必要）。")
+                st.error("動画のコマ数が短すぎます（最低5コマ必要です）。")
                 st.stop()
             else:
                 selected_frames = frames
 
-            # 2. 再生時間補正（1〜4秒の整数秒）
-            raw_duration_sec = total_f / fps
-            target_sec = max(1, min(4, round(raw_duration_sec)))
-            frame_duration_ms = int((target_sec * 1000) / len(selected_frames))
+            # 2. 秒数＆ループ回数の計算（規約: 1~4秒の整数秒、ループ1~4回）
+            raw_duration_sec = len(selected_frames) / fps
+            is_auto = "自動最適化" in mode
+            loop_count, total_sec, durations_list = calculate_line_animation_timing(
+                raw_duration_sec, len(selected_frames), is_auto, manual_target_sec, manual_loop_count
+            )
             
-            # 3. グリッド切出 ＆ キャラ内部白保護透過
+            # 3. グリッド切出 ＆ キャラ内部白保護透過処理
             h, w, _ = selected_frames[0].shape
             cell_h = h // ROWS
             cell_w = w // COLS
@@ -211,18 +270,17 @@ if uploaded_file is not None:
                 
                 progress_bar.progress((f_idx + 1) / len(selected_frames))
                 
-            # 4. キャラ自動認識 ＆ センタリング ＆ APNG書き出し
+            # 4. キャラ自動認識 ＆ センタリング ＆ 規約適合APNG書き出し
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w") as zip_file:
                 for idx in range(12):
-                    # 全コマからキャラ領域を特定し、320x270の中央へセンタリング配置
                     centered_frames = center_and_fit_stamp(raw_stamp_frames[idx], target_w=320, target_h=270)
                     
-                    # 1MB以下適合APNG化
-                    apng_data = optimize_apng_bytes(centered_frames, frame_duration_ms)
+                    # 指定のループ数・コマ表示時間でAPNG化
+                    apng_data = optimize_apng_bytes(centered_frames, durations_list, loop_count)
                     zip_file.writestr(f"stamp_{idx+1:02d}.png", apng_data)
                     
-            st.success(f"🎉 変換完了！ キャラクターを自動認識し、中央にセンタリング配置しました。（再生時間: {target_sec}秒 / {len(selected_frames)}コマ / 全ファイル1MB以下）")
+            st.success(f"🎉 変換完了！【審査適合スペック】 総再生時間: {total_sec}秒 / ループ回数: {loop_count}回 / コマ数: {len(selected_frames)}コマ / 全ファイル1MB以下")
             
             st.download_button(
                 label="📦 LINE審査適合スタンプを一括ダウンロード (ZIP)",
