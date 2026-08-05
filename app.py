@@ -7,10 +7,10 @@ import zipfile
 import os
 import tempfile
 
-st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="centered")
+st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="wide")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("動画解析後、プレビューを見ながら「コマ切り出し」「透過・マスク」「速度調整」を自由に行い、個別保存または一括ZIPダウンロードできます。")
+st.caption("動画解析後、中央プレビューを見ながら両サイドの操作バーで「切り出し」「マスク」「透過」を自在に調整できます。")
 
 if 'raw_stamps' not in st.session_state:
     st.session_state['raw_stamps'] = None
@@ -234,111 +234,97 @@ if uploaded_file is not None:
                                 raw_stamps[idx].append(cell)
                                 
                     st.session_state['raw_stamps'] = raw_stamps
-                    st.success("解析が完了しました！下部の編集エリアでコマ数・透過調整を行ってください。")
+                    st.success("解析が完了しました！下部の編集エリアで調整を行ってください。")
                 else:
                     st.error("動画フレームの読み込みに失敗しました。正しい動画ファイルかご確認ください。")
             except Exception as e:
                 st.error(f"解析中にエラーが発生しました: {e}")
 
-# --- Step 2: プレビュー ＆ 高度編集エリア ---
+# --- Step 2: 3カラム（左: アニメ設定 / 中央: 大画面プレビュー / 右: マスク・透過） ---
 if st.session_state['raw_stamps'] is not None:
     st.divider()
-    st.header("🎛️ スタンプ編集 ＆ リアルタイムプレビュー")
+    st.header("🎛️ 3画面 リアルタイムスタンプ編集ワークスペース")
     
     raw_stamps_data = st.session_state['raw_stamps']
     max_raw_frames = max(1, len(raw_stamps_data.get(0, [])))
     
-    col_preview, col_controls = st.columns([1, 1.2])
+    # 画面を横いっぱいに使い 1 : 1.4 : 1 の3カラムに分割
+    col_left, col_center, col_right = st.columns([1, 1.4, 1])
     
-    with col_controls:
-        st.subheader("🛠️ 編集コントロール")
+    # ------------------- 左カラム: アニメーション＆タイムライン -------------------
+    with col_left:
+        st.subheader("🎞️ アニメ設定")
+        selected_stamp_idx = st.number_input("スタンプ番号 (1〜12)", min_value=1, max_value=12, value=1) - 1
         
-        # 1. スタンプ選択
-        selected_stamp_idx = st.number_input("確認・編集するスタンプ番号 (1〜12)", min_value=1, max_value=12, value=1) - 1
-        
-        # 2. アニメーション切り出し・コマ数設定（一番上に配置してプレビューを見ながら即座に操作可能に！）
         st.markdown("---")
-        st.markdown("##### 🎞️ アニメーション切り出し・コマ数（LINE規格: 5〜20コマ）")
-        
         if max_raw_frames > 1:
             frame_range = st.slider(
-                "元動画の使用範囲（開始コマ 〜 終了コマ）",
+                "元動画の使用範囲",
                 min_value=1, max_value=max_raw_frames,
                 value=(1, max_raw_frames),
-                help="動画内の使用したい区間を指定できます。"
+                help="切り出すコマの開始〜終了位置を指定します"
             )
         else:
             frame_range = (1, 1)
 
         default_target_count = min(20, max(5, max_raw_frames))
         target_frame_count = st.slider(
-            "出力コマ数 (LINE規定: 5〜20コマ厳守)",
-            min_value=5, max_value=20, value=default_target_count, step=1,
-            help="LINEスタンプ規約に従い、出力されるAPNGの枚数を5〜20コマの範囲で指定します。"
+            "出力コマ数 (5〜20コマ)",
+            min_value=5, max_value=20, value=default_target_count, step=1
         )
         
-        col_loop1, col_loop2 = st.columns(2)
-        with col_loop1:
-            ping_pong = st.checkbox("🔄 往復再生（ピンポン）", value=False)
-        with col_loop2:
-            trim_end = st.checkbox("✂️ ループ末尾カット", value=True)
-            
-        # 再生時間・ループ数
-        col_time1, col_time2 = st.columns(2)
-        with col_time1:
-            target_sec = st.selectbox("総再生時間 (秒)", [1, 2, 3, 4], index=1)
-        with col_time2:
-            loop_count = st.selectbox("ループ回数", [1, 2, 3, 4], index=1)
+        ping_pong = st.checkbox("🔄 往復再生（ピンポン）", value=False)
+        trim_end = st.checkbox("✂️ ループ末尾カット", value=True)
+        
+        target_sec = st.selectbox("総再生時間 (秒)", [1, 2, 3, 4], index=1)
+        loop_count = st.selectbox("ループ回数", [1, 2, 3, 4], index=1)
 
-        # 3. マスク＆透過感度（タブ分けして省スペース化！）
+    # ------------------- 右カラム: マスク・トリミング ＆ 透過度 -------------------
+    with col_right:
+        st.subheader("✂️ マスク ＆ 透過")
+        filter_noise = st.checkbox("🧹 見切れゴミ（Zzz等）自動除去", value=True)
+        
+        st.markdown("**端のカット (見切れ削除)**")
+        crop_right_pct = st.slider("右端削り (%)", min_value=0, max_value=50, value=15, step=1)
+        crop_left_pct = st.slider("左端削り (%)", min_value=0, max_value=50, value=0, step=1)
+        crop_top_pct = st.slider("上端削り (%)", min_value=0, max_value=50, value=0, step=1)
+        crop_bottom_pct = st.slider("下端削り (%)", min_value=0, max_value=50, value=0, step=1)
+        
         st.markdown("---")
-        tab_mask, filter_tab = st.tabs(["✂️ マスク・トリミング (見切れ消し)", "🎨 透過・影消し感度"])
-        
-        with tab_mask:
-            filter_noise = st.checkbox("🧹 離れた見切れゴミ（Zzz等）を自動除去", value=True)
-            crop_c1, crop_c2 = st.columns(2)
-            with crop_c1:
-                crop_right_pct = st.slider("右端を削る (%)", min_value=0, max_value=50, value=15, step=1)
-                crop_left_pct = st.slider("左端を削る (%)", min_value=0, max_value=50, value=0, step=1)
-            with crop_c2:
-                crop_top_pct = st.slider("上端を削る (%)", min_value=0, max_value=50, value=0, step=1)
-                crop_bottom_pct = st.slider("下端を削る (%)", min_value=0, max_value=50, value=0, step=1)
-                
-        with filter_tab:
-            tolerance = st.slider(
-                "透過の強さ（しきい値）",
-                min_value=10, max_value=150, value=75, step=5,
-                help="数値を上げると足元の影や周りの薄いグレーが消えます。"
-            )
-        
-        # 処理の適用
-        current_raw_cells = raw_stamps_data.get(selected_stamp_idx, raw_stamps_data.get(0, []))
-        cropped_cells = [crop_cell_margins(c, crop_left_pct, crop_right_pct, crop_top_pct, crop_bottom_pct) for c in current_raw_cells]
-        current_transparent_frames = [remove_background_floodfill_outer(c, tolerance=tolerance, filter_noise=filter_noise) for c in cropped_cells]
-        current_centered_frames = center_and_fit_stamp(current_transparent_frames)
-        
-        edited_frames = process_frame_sequence_strict(
-            current_centered_frames, frame_range[0], frame_range[1],
-            target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
+        st.markdown("**🎨 透過感度**")
+        tolerance = st.slider(
+            "透過の強さ (しきい値)",
+            min_value=10, max_value=150, value=75, step=5,
+            help="足元の影や薄いゴミを消す強さです"
         )
-        
-        total_ms = target_sec * 1000
-        loop_ms = total_ms // loop_count
-        frame_cnt = len(edited_frames)
-        frame_duration_ms = max(50, loop_ms // frame_cnt)
-        
-        base_ms = loop_ms // frame_cnt
-        remainder = loop_ms % frame_cnt
-        durations_list = [base_ms] * frame_cnt
-        for i in range(remainder):
-            durations_list[i] += 1
-            
-        st.success(f"✅ LINE規約適合: **全{frame_cnt}コマ** / 1コマ **{frame_duration_ms}ms** / **{loop_count}回再生** ({target_sec}秒)")
-        
-    with col_preview:
-        st.subheader("👁️ リアルタイムアニメーション")
+
+    # ------------------- データ処理計算 -------------------
+    current_raw_cells = raw_stamps_data.get(selected_stamp_idx, raw_stamps_data.get(0, []))
+    cropped_cells = [crop_cell_margins(c, crop_left_pct, crop_right_pct, crop_top_pct, crop_bottom_pct) for c in current_raw_cells]
+    current_transparent_frames = [remove_background_floodfill_outer(c, tolerance=tolerance, filter_noise=filter_noise) for c in cropped_cells]
+    current_centered_frames = center_and_fit_stamp(current_transparent_frames)
+    
+    edited_frames = process_frame_sequence_strict(
+        current_centered_frames, frame_range[0], frame_range[1],
+        target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
+    )
+    
+    total_ms = target_sec * 1000
+    loop_ms = total_ms // loop_count
+    frame_cnt = len(edited_frames)
+    frame_duration_ms = max(50, loop_ms // frame_cnt)
+    
+    base_ms = loop_ms // frame_cnt
+    remainder = loop_ms % frame_cnt
+    durations_list = [base_ms] * frame_cnt
+    for i in range(remainder):
+        durations_list[i] += 1
+
+    # ------------------- 中央カラム: 大画面アニメーションプレビュー -------------------
+    with col_center:
+        st.subheader("👁️ プレビュー確認 (大画面)")
         preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
-        st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} プレビュー (出力: {frame_cnt}コマ)")
+        st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} | {frame_cnt}コマ / {target_sec}秒 ({loop_count}回再生)")
         
         single_apng_data = optimize_apng_bytes(edited_frames, durations_list, loop_count)
         st.download_button(
@@ -347,6 +333,7 @@ if st.session_state['raw_stamps'] is not None:
             file_name=f"stamp_{selected_stamp_idx+1:02d}.png",
             mime="image/png"
         )
+        st.success(f"✅ LINE適合: **{frame_cnt}コマ** / 1コマ **{frame_duration_ms}ms** / 計 **{target_sec}秒**")
         
     st.divider()
     
