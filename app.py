@@ -10,7 +10,7 @@ import tempfile
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="centered")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("動画解析後、プレビューを見ながら「透過の強さ（影消し）」「コマ数（5〜20コマ制限）」「往復再生」「速度調整」を自由に行い、個別保存または一括ZIPダウンロードできます。")
+st.caption("動画解析後、プレビューを見ながら「マスク（見切れ消し）」「透過感度」「コマ数」「往復再生」「速度調整」を自由に行い、個別保存または一括ZIPダウンロードできます。")
 
 if 'raw_stamps' not in st.session_state:
     st.session_state['raw_stamps'] = None
@@ -20,7 +20,47 @@ if 'fps' not in st.session_state:
 ROWS = 3
 COLS = 4
 
-def remove_background_floodfill_outer(cell_bgr, tolerance=70):
+def crop_cell_margins(cell_bgr, crop_left_pct=0, crop_right_pct=0, crop_top_pct=0, crop_bottom_pct=0):
+    """画面端の不要な見切れ領域をカットする関数"""
+    h, w, _ = cell_bgr.shape
+    top = int(h * crop_top_pct / 100.0)
+    bottom = h - int(h * crop_bottom_pct / 100.0)
+    left = int(w * crop_left_pct / 100.0)
+    right = w - int(w * crop_right_pct / 100.0)
+    
+    if bottom <= top + 10:
+        bottom = top + 10
+    if right <= left + 10:
+        right = left + 10
+        
+    return cell_bgr[top:bottom, left:right]
+
+def remove_isolated_noise_alpha(alpha_channel, min_size_pct=0.015):
+    """メインキャラ以外の小さな見切れゴミ（Zzzマークや隣のキャラの端など）を自動消去"""
+    h, w = alpha_channel.shape
+    total_area = h * w
+    min_area = total_area * min_size_pct
+    
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats((alpha_channel > 127).astype(np.uint8))
+    if num_labels <= 2:
+        return alpha_channel
+        
+    new_alpha = np.zeros_like(alpha_channel)
+    areas = [(i, stats[i, cv2.CC_STAT_AREA]) for i in range(1, num_labels)]
+    areas.sort(key=lambda x: x[1], reverse=True)
+    
+    # 一番大きな領域（メインキャラ）は必ず保持
+    largest_idx = areas[0][0]
+    new_alpha[labels == largest_idx] = 255
+    
+    # ある程度の大きさがあるパーツ（手足や装飾）も保持
+    for idx, area in areas[1:]:
+        if area >= min_area:
+            new_alpha[labels == idx] = 255
+            
+    return new_alpha
+
+def remove_background_floodfill_outer(cell_bgr, tolerance=70, filter_noise=True):
     """外枠からの塗りつぶしで背景や足元の影を自動透過（キャラ内部の白は完全保護）"""
     h, w, _ = cell_bgr.shape
     mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
@@ -50,6 +90,10 @@ def remove_background_floodfill_outer(cell_bgr, tolerance=70):
             
     bg_mask = mask[1:h+1, 1:w+1]
     alpha = np.where(bg_mask == 255, 0, 255).astype(np.uint8)
+    
+    if filter_noise:
+        alpha = remove_isolated_noise_alpha(alpha)
+        
     alpha_blurred = cv2.GaussianBlur(alpha, (3, 3), 0)
     _, alpha_smoothed = cv2.threshold(alpha_blurred, 127, 255, cv2.THRESH_BINARY)
     
@@ -99,10 +143,7 @@ def center_and_fit_stamp(frame_list, target_w=320, target_h=270, padding=12):
     return centered_frames
 
 def process_frame_sequence_strict(frames, start_frame, end_frame, target_frame_count=15, ping_pong=False, trim_end=False):
-    """
-    コマの選択・トリミング・往復再生・重複削除を行った上で、
-    LINE規格の【5〜20コマ以内】に厳密に収める関数
-    """
+    """コマの選択・トリミング・往復再生・重複削除を行った上で、LINE規格の【5〜20コマ以内】に厳密に収める関数"""
     sub = frames[start_frame - 1 : end_frame]
     if not sub:
         sub = frames
@@ -217,6 +258,19 @@ if st.session_state['raw_stamps'] is not None:
         # スタンプ選択
         selected_stamp_idx = st.number_input("確認・編集するスタンプ番号 (1〜12)", min_value=1, max_value=12, value=1) - 1
         
+        # マスク・トリミング (端の見切れ消し)
+        st.markdown("---")
+        st.markdown("##### ✂️ マスク・画面端のトリミング (見切れ消し)")
+        filter_noise = st.checkbox("🧹 離れた小さな見切れノイズ（Zzzマーク等）を自動除去", value=True, help="メインキャラから離れた不要な見切れノイズを自動的にクリアします")
+        
+        crop_col1, crop_col2 = st.columns(2)
+        with crop_col1:
+            crop_right_pct = st.slider("右端を削る (%)", min_value=0, max_value=50, value=15, step=1, help="右側にある隣の見切れやZzzマークを削ります")
+            crop_left_pct = st.slider("左端を削る (%)", min_value=0, max_value=50, value=0, step=1)
+        with crop_col2:
+            crop_top_pct = st.slider("上端を削る (%)", min_value=0, max_value=50, value=0, step=1)
+            crop_bottom_pct = st.slider("下端を削る (%)", min_value=0, max_value=50, value=0, step=1)
+            
         # 透過感度スライダー (影消し・ノイズ除去)
         st.markdown("---")
         st.markdown("##### 🎨 透過の強さ（感度・影消し）")
@@ -256,9 +310,10 @@ if st.session_state['raw_stamps'] is not None:
         target_sec = st.selectbox("総再生時間 (LINE規定: 1~4秒の整数秒)", [1, 2, 3, 4], index=1)
         loop_count = st.selectbox("1スタンプあたりのループ回数", [1, 2, 3, 4], index=1)
         
-        # 選択されたスタンプセルに対して、現在の感度でリアルタイム背景透過＋センタリング適用
+        # 現在のトリミング設定でクロップ ➔ 背景透過 ➔ センタリング処理を実行
         current_raw_cells = raw_stamps_data.get(selected_stamp_idx, raw_stamps_data.get(0, []))
-        current_transparent_frames = [remove_background_floodfill_outer(cell, tolerance=tolerance) for cell in current_raw_cells]
+        cropped_cells = [crop_cell_margins(c, crop_left_pct, crop_right_pct, crop_top_pct, crop_bottom_pct) for c in current_raw_cells]
+        current_transparent_frames = [remove_background_floodfill_outer(c, tolerance=tolerance, filter_noise=filter_noise) for c in cropped_cells]
         current_centered_frames = center_and_fit_stamp(current_transparent_frames)
         
         edited_frames = process_frame_sequence_strict(
@@ -307,7 +362,8 @@ if st.session_state['raw_stamps'] is not None:
                 with zipfile.ZipFile(zip_buffer, "w") as zip_file:
                     for idx in range(12):
                         raw_cells = raw_stamps_data.get(idx, [])
-                        trans_frames = [remove_background_floodfill_outer(c, tolerance=tolerance) for c in raw_cells]
+                        c_cells = [crop_cell_margins(c, crop_left_pct, crop_right_pct, crop_top_pct, crop_bottom_pct) for c in raw_cells]
+                        trans_frames = [remove_background_floodfill_outer(c, tolerance=tolerance, filter_noise=filter_noise) for c in c_cells]
                         cent_frames = center_and_fit_stamp(trans_frames)
                         proc_f = process_frame_sequence_strict(
                             cent_frames, frame_range[0], frame_range[1],
