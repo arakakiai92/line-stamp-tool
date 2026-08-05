@@ -10,7 +10,7 @@ import tempfile
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="centered")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("動画解析後、プレビューを見ながら「マスク（見切れ消し）」「透過感度」「コマ数」「往復再生」「速度調整」を自由に行い、個別保存または一括ZIPダウンロードできます。")
+st.caption("動画解析後、プレビューを見ながら「コマ切り出し」「透過・マスク」「速度調整」を自由に行い、個別保存または一括ZIPダウンロードできます。")
 
 if 'raw_stamps' not in st.session_state:
     st.session_state['raw_stamps'] = None
@@ -36,7 +36,7 @@ def crop_cell_margins(cell_bgr, crop_left_pct=0, crop_right_pct=0, crop_top_pct=
     return cell_bgr[top:bottom, left:right]
 
 def remove_isolated_noise_alpha(alpha_channel, min_size_pct=0.015):
-    """メインキャラ以外の小さな見切れゴミ（Zzzマークや隣のキャラの端など）を自動消去"""
+    """メインキャラ以外の小さな見切れゴミ（Zzzマーク等）を自動消去"""
     h, w = alpha_channel.shape
     total_area = h * w
     min_area = total_area * min_size_pct
@@ -49,11 +49,9 @@ def remove_isolated_noise_alpha(alpha_channel, min_size_pct=0.015):
     areas = [(i, stats[i, cv2.CC_STAT_AREA]) for i in range(1, num_labels)]
     areas.sort(key=lambda x: x[1], reverse=True)
     
-    # 一番大きな領域（メインキャラ）は必ず保持
     largest_idx = areas[0][0]
     new_alpha[labels == largest_idx] = 255
     
-    # ある程度の大きさがあるパーツ（手足や装飾）も保持
     for idx, area in areas[1:]:
         if area >= min_area:
             new_alpha[labels == idx] = 255
@@ -61,7 +59,7 @@ def remove_isolated_noise_alpha(alpha_channel, min_size_pct=0.015):
     return new_alpha
 
 def remove_background_floodfill_outer(cell_bgr, tolerance=70, filter_noise=True):
-    """外枠からの塗りつぶしで背景や足元の影を自動透過（キャラ内部の白は完全保護）"""
+    """外枠からの塗りつぶしで背景や足元の影を自動透過"""
     h, w, _ = cell_bgr.shape
     mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
     img_work = cell_bgr.copy()
@@ -255,41 +253,12 @@ if st.session_state['raw_stamps'] is not None:
     with col_controls:
         st.subheader("🛠️ 編集コントロール")
         
-        # スタンプ選択
+        # 1. スタンプ選択
         selected_stamp_idx = st.number_input("確認・編集するスタンプ番号 (1〜12)", min_value=1, max_value=12, value=1) - 1
         
-        # マスク・トリミング (端の見切れ消し)
+        # 2. アニメーション切り出し・コマ数設定（一番上に配置してプレビューを見ながら即座に操作可能に！）
         st.markdown("---")
-        st.markdown("##### ✂️ マスク・画面端のトリミング (見切れ消し)")
-        filter_noise = st.checkbox("🧹 離れた小さな見切れノイズ（Zzzマーク等）を自動除去", value=True, help="メインキャラから離れた不要な見切れノイズを自動的にクリアします")
-        
-        crop_col1, crop_col2 = st.columns(2)
-        with crop_col1:
-            crop_right_pct = st.slider("右端を削る (%)", min_value=0, max_value=50, value=15, step=1, help="右側にある隣の見切れやZzzマークを削ります")
-            crop_left_pct = st.slider("左端を削る (%)", min_value=0, max_value=50, value=0, step=1)
-        with crop_col2:
-            crop_top_pct = st.slider("上端を削る (%)", min_value=0, max_value=50, value=0, step=1)
-            crop_bottom_pct = st.slider("下端を削る (%)", min_value=0, max_value=50, value=0, step=1)
-            
-        # 透過感度スライダー (影消し・ノイズ除去)
-        st.markdown("---")
-        st.markdown("##### 🎨 透過の強さ（感度・影消し）")
-        tolerance = st.slider(
-            "透過の強さ（しきい値）",
-            min_value=10, max_value=150, value=75, step=5,
-            help="数値を上げると足元の影や周りの薄いグレー・ノイズがきれいに消えます。"
-        )
-        
-        # コマ範囲 ＆ 出力コマ数（LINE規格5〜20コマ厳守）スライダー
-        st.markdown("---")
-        st.markdown("##### 🎞️ 出力コマ数・アニメーション切り出し（LINE規格: 5〜20コマ）")
-        
-        default_target_count = min(20, max(5, max_raw_frames))
-        target_frame_count = st.slider(
-            "出力コマ数 (LINE規定: 5〜20コマ厳守)",
-            min_value=5, max_value=20, value=default_target_count, step=1,
-            help="LINEスタンプ規約に従い、出力されるAPNGの枚数を5〜20コマの範囲で指定します。"
-        )
+        st.markdown("##### 🎞️ アニメーション切り出し・コマ数（LINE規格: 5〜20コマ）")
         
         if max_raw_frames > 1:
             frame_range = st.slider(
@@ -300,17 +269,49 @@ if st.session_state['raw_stamps'] is not None:
             )
         else:
             frame_range = (1, 1)
+
+        default_target_count = min(20, max(5, max_raw_frames))
+        target_frame_count = st.slider(
+            "出力コマ数 (LINE規定: 5〜20コマ厳守)",
+            min_value=5, max_value=20, value=default_target_count, step=1,
+            help="LINEスタンプ規約に従い、出力されるAPNGの枚数を5〜20コマの範囲で指定します。"
+        )
         
-        ping_pong = st.checkbox("🔄 往復再生（ピンポンループ）を有効にする", value=False, help="1➔2➔3➔2 のように動きを往復させて滑らかな無限ループを作成します")
-        trim_end = st.checkbox("✂️ ループ時の最後の重複コマを1枚カットする", value=True, help="ループ直前のカクつき・一瞬の停止を防ぎます")
-        
-        # 時間・ループ数
+        col_loop1, col_loop2 = st.columns(2)
+        with col_loop1:
+            ping_pong = st.checkbox("🔄 往復再生（ピンポン）", value=False)
+        with col_loop2:
+            trim_end = st.checkbox("✂️ ループ末尾カット", value=True)
+            
+        # 再生時間・ループ数
+        col_time1, col_time2 = st.columns(2)
+        with col_time1:
+            target_sec = st.selectbox("総再生時間 (秒)", [1, 2, 3, 4], index=1)
+        with col_time2:
+            loop_count = st.selectbox("ループ回数", [1, 2, 3, 4], index=1)
+
+        # 3. マスク＆透過感度（タブ分けして省スペース化！）
         st.markdown("---")
-        st.markdown("##### ⏱️ 再生時間・ループ設定")
-        target_sec = st.selectbox("総再生時間 (LINE規定: 1~4秒の整数秒)", [1, 2, 3, 4], index=1)
-        loop_count = st.selectbox("1スタンプあたりのループ回数", [1, 2, 3, 4], index=1)
+        tab_mask, filter_tab = st.tabs(["✂️ マスク・トリミング (見切れ消し)", "🎨 透過・影消し感度"])
         
-        # 現在のトリミング設定でクロップ ➔ 背景透過 ➔ センタリング処理を実行
+        with tab_mask:
+            filter_noise = st.checkbox("🧹 離れた見切れゴミ（Zzz等）を自動除去", value=True)
+            crop_c1, crop_c2 = st.columns(2)
+            with crop_c1:
+                crop_right_pct = st.slider("右端を削る (%)", min_value=0, max_value=50, value=15, step=1)
+                crop_left_pct = st.slider("左端を削る (%)", min_value=0, max_value=50, value=0, step=1)
+            with crop_c2:
+                crop_top_pct = st.slider("上端を削る (%)", min_value=0, max_value=50, value=0, step=1)
+                crop_bottom_pct = st.slider("下端を削る (%)", min_value=0, max_value=50, value=0, step=1)
+                
+        with filter_tab:
+            tolerance = st.slider(
+                "透過の強さ（しきい値）",
+                min_value=10, max_value=150, value=75, step=5,
+                help="数値を上げると足元の影や周りの薄いグレーが消えます。"
+            )
+        
+        # 処理の適用
         current_raw_cells = raw_stamps_data.get(selected_stamp_idx, raw_stamps_data.get(0, []))
         cropped_cells = [crop_cell_margins(c, crop_left_pct, crop_right_pct, crop_top_pct, crop_bottom_pct) for c in current_raw_cells]
         current_transparent_frames = [remove_background_floodfill_outer(c, tolerance=tolerance, filter_noise=filter_noise) for c in cropped_cells]
@@ -332,21 +333,19 @@ if st.session_state['raw_stamps'] is not None:
         for i in range(remainder):
             durations_list[i] += 1
             
-        st.success(f"✅ LINE規約適合: **全{frame_cnt}コマ** （規定範囲: 5〜20コマ内） / 1コマ当たり **{frame_duration_ms}ms** / **{loop_count}回再生**で計 **{target_sec}秒**")
+        st.success(f"✅ LINE規約適合: **全{frame_cnt}コマ** / 1コマ **{frame_duration_ms}ms** / **{loop_count}回再生** ({target_sec}秒)")
         
     with col_preview:
         st.subheader("👁️ リアルタイムアニメーション")
         preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
         st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} プレビュー (出力: {frame_cnt}コマ)")
         
-        # --- 個別保存ボタン ---
         single_apng_data = optimize_apng_bytes(edited_frames, durations_list, loop_count)
         st.download_button(
             label=f"💾 スタンプ #{selected_stamp_idx + 1} を個別ダウンロード (APNG)",
             data=single_apng_data,
             file_name=f"stamp_{selected_stamp_idx+1:02d}.png",
-            mime="image/png",
-            help="現在プレビュー表示されているスタンプだけをAPNG形式でダウンロードします"
+            mime="image/png"
         )
         
     st.divider()
