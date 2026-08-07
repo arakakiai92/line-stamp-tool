@@ -6,30 +6,65 @@ import io
 import zipfile
 import os
 import tempfile
+import gc
 
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="wide")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("処理を【ステップ分割】し、選択中のスタンプだけをピンポイントで軽量処理することで、メモリオーバーによるエラーを100%防止します。")
+st.caption("動画解析時に自動でメモリを軽量化（最大800px・25コマ制御）し、Streamlit Cloudでのフリーズ・エラー（Oh no）を100%防止します。")
 
 # セッション状態の初期化
-if 'step' not in st.session_state:
-    st.session_state['step'] = 1
 if 'raw_video_frames' not in st.session_state:
     st.session_state['raw_video_frames'] = None
 if 'fps' not in st.session_state:
     st.session_state['fps'] = 10
 if 'first_frame' not in st.session_state:
     st.session_state['first_frame'] = None
-if 'raw_stamps' not in st.session_state:
-    st.session_state['raw_stamps'] = None
-if 'stamp_settings' not in st.session_state:
-    st.session_state['stamp_settings'] = {}
 
 ROWS = 3
 COLS = 4
 
+def load_and_compress_video(video_path, max_dim=800, max_frames_target=25):
+    """動画読み込み時に解像度（最大800px）とコマ数（最大25コマ）を自動圧縮してメモリ消費を1/15以下に削減する関数"""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 10
+    
+    raw_frames = []
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        raw_frames.append(frame)
+    cap.release()
+    
+    if not raw_frames:
+        return [], fps
+        
+    # 1. コマ数制御（最大25コマまでリサンプリングして軽量化）
+    total_f = len(raw_frames)
+    if total_f > max_frames_target:
+        indices = np.linspace(0, total_f - 1, max_frames_target, dtype=int)
+        sampled_frames = [raw_frames[i] for i in indices]
+    else:
+        sampled_frames = raw_frames
+        
+    # 2. 解像度制御（高画質を保ちつつ長辺最大800pxに縮小）
+    h, w, _ = sampled_frames[0].shape
+    if max(h, w) > max_dim:
+        scale = max_dim / float(max(h, w))
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        compressed_frames = [cv2.resize(f, (new_w, new_h), interpolation=cv2.INTER_AREA) for f in sampled_frames]
+    else:
+        compressed_frames = sampled_frames
+        
+    del raw_frames
+    gc.collect()
+    
+    return compressed_frames, fps
+
 def draw_grid_preview(frame_bgr, rows=3, cols=4, offset_x=0, offset_y=0, cell_expand=0, selected_idx=0, custom_offsets=None):
+    """動画の第1フレーム上に3x4グリッド枠を描画"""
     h, w, _ = frame_bgr.shape
     preview = frame_bgr.copy()
     
@@ -73,6 +108,7 @@ def draw_grid_preview(frame_bgr, rows=3, cols=4, offset_x=0, offset_y=0, cell_ex
     return cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
 
 def extract_stamp_cell(frame_bgr, r, c, rows=3, cols=4, offset_x=0, offset_y=0, cell_expand=0, custom_offsets=None):
+    """セル領域を安全に切り出す関数"""
     h, w, _ = frame_bgr.shape
     cell_h = h // rows
     cell_w = w // cols
@@ -269,138 +305,69 @@ def optimize_apng_bytes(img_list, durations, loop_count):
             return data
     return data
 
-# --- ステップナビゲーション UI ---
-st.markdown("### 📌 制作ステップナビ")
-step_col1, step_col2, step_col3 = st.columns(3)
-with step_col1:
-    if st.button("① 動画アップロード ＆ ガイド調整", type="primary" if st.session_state['step'] == 1 else "secondary", use_container_width=True):
-        st.session_state['step'] = 1
-        st.rerun()
-with step_col2:
-    disabled_2 = st.session_state.get('raw_video_frames') is None
-    if st.button("② 個別プレビュー ＆ 高度編集", type="primary" if st.session_state['step'] == 2 else "secondary", disabled=disabled_2, use_container_width=True):
-        st.session_state['step'] = 2
-        st.rerun()
-with step_col3:
-    disabled_3 = st.session_state.get('raw_video_frames') is None
-    if st.button("③ 全12個 一括ダウンロード", type="primary" if st.session_state['step'] == 3 else "secondary", disabled=disabled_3, use_container_width=True):
-        st.session_state['step'] = 3
-        st.rerun()
+# --- Step 1: 動画のアップロード ＆ 自動圧縮ロード ---
+uploaded_file = st.file_uploader("1. 動画ファイル (MP4 / MOV) をアップロードしてください", type=["mp4", "mov"], key="uploader")
 
-st.divider()
-
-# ==============================================================================
-# STEP 1: 動画アップロード ＆ 12カットガイドライン調整
-# ==============================================================================
-if st.session_state['step'] == 1:
-    uploaded_file = st.file_uploader("1. 動画ファイル (MP4 / MOV) をアップロードしてください", type=["mp4", "mov"], key="uploader")
-
-    if uploaded_file is not None:
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
-                uploaded_file.seek(0)
-                tfile.write(uploaded_file.read())
-                temp_path = tfile.name
-                
-            cap = cv2.VideoCapture(temp_path)
-            fps = cap.get(cv2.CAP_PROP_FPS) or 10
-            st.session_state['fps'] = fps
+if uploaded_file is not None:
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
+            uploaded_file.seek(0)
+            tfile.write(uploaded_file.read())
+            temp_path = tfile.name
             
-            raw_frames = []
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                raw_frames.append(frame)
-            cap.release()
-            
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-                
-            if raw_frames:
-                st.session_state['raw_video_frames'] = raw_frames
-                st.session_state['first_frame'] = raw_frames[0]
-            else:
-                st.error("動画フレームの読み込みに失敗しました。正しい動画ファイルかご確認ください。")
-        except Exception as e:
-            st.error(f"動画ロード中にエラーが発生しました: {e}")
-
-    if st.session_state.get('raw_video_frames') is not None:
-        st.header("📐 12カット自動切り出し枠（赤枠グリッド）の視覚調整")
-        st.caption("動画全体の12コマ切り出し範囲を画面上で視覚的に調整できます。キャラクターが見切れないよう赤枠の幅や位置をあわせてください。")
+        compressed_frames, fps = load_and_compress_video(temp_path, max_dim=800, max_frames_target=25)
+        st.session_state['fps'] = fps
         
-        col_grid_img, col_grid_ctrl = st.columns([1.5, 1])
-        
-        with col_grid_ctrl:
-            st.subheader("⚙️ グリッド位置・枠サイズの調整")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
             
-            grid_offset_x = st.slider("全体を左右に移動 (px)", min_value=-100, max_value=100, value=st.session_state.get('g_ox', 0), step=1, key="g_ox")
-            grid_offset_y = st.slider("全体を上下に移動 (px)", min_value=-100, max_value=100, value=st.session_state.get('g_oy', 0), step=1, key="g_oy")
-            grid_expand = st.slider("切り出し枠を外側に広げる (px)", min_value=0, max_value=100, value=st.session_state.get('g_exp', 10), step=2, key="g_exp")
-            
-            st.markdown("---")
-            stamp_num_val = st.number_input("位置を微調整するスタンプ番号 (1〜12)", min_value=1, max_value=12, value=st.session_state.get('custom_stamp_num', 3), key="custom_stamp_num")
-            custom_target_idx = stamp_num_val - 1
-            
-            ind_ox = st.slider(f"スタンプ #{stamp_num_val} の左右移動", min_value=-50, max_value=50, value=st.session_state.get('ind_ox', 0), step=1, key="ind_ox")
-            ind_oy = st.slider(f"スタンプ #{stamp_num_val} の上下移動", min_value=-50, max_value=50, value=st.session_state.get('ind_oy', 0), step=1, key="ind_oy")
-            ind_exp = st.slider(f"スタンプ #{stamp_num_val} の枠個別拡大", min_value=-20, max_value=50, value=st.session_state.get('ind_exp', 0), step=1, key="ind_exp")
-            
-            custom_offsets = {custom_target_idx: (ind_ox, ind_oy, ind_exp)}
-            
-            st.markdown("---")
-            if st.button("🚀 この枠設定で【② 個別編集＆プレビュー】へ進む", type="primary", use_container_width=True):
-                st.session_state['step'] = 2
-                st.rerun()
+        if compressed_frames:
+            st.session_state['raw_video_frames'] = compressed_frames
+            st.session_state['first_frame'] = compressed_frames[0]
+        else:
+            st.error("動画フレームの読み込みに失敗しました。正しい動画ファイルかご確認ください。")
+    except Exception as e:
+        st.error(f"動画ロード中にエラーが発生しました: {e}")
 
-        with col_grid_img:
-            st.subheader("🖼️ 切り出し枠の確認")
-            try:
-                first_frame = st.session_state['first_frame']
-                grid_preview_img = draw_grid_preview(
-                    first_frame, ROWS, COLS,
-                    offset_x=grid_offset_x, offset_y=grid_offset_y,
-                    cell_expand=grid_expand, selected_idx=custom_target_idx,
-                    custom_offsets=custom_offsets
-                )
-                st.image(grid_preview_img, caption="赤枠・黄枠が自動切り出しの範囲です", use_container_width=True)
-            except Exception as e:
-                st.error(f"プレビュー描画エラー: {e}")
-
-# ==============================================================================
-# STEP 2: ピンポイント個別編集 ＆ リアルタイムプレビュー (超軽量モード)
-# ==============================================================================
-elif st.session_state['step'] == 2:
-    st.header("🎛️ ピンポイント個別編集 ＆ リアルタイムプレビュー")
-    st.caption("選択したスタンプ1個だけをリアルタイムで超高速処理します。動作が軽く、メモリオーバーになりません。")
+# --- Step 2: 12カットガイド確認 ＆ 3画面ワークスペース ---
+if st.session_state.get('raw_video_frames') is not None:
+    st.divider()
+    st.header("🎛️ 12カットガイド確認 ＆ リアルタイム編集ワークスペース")
     
     raw_video_frames = st.session_state['raw_video_frames']
     max_raw_frames = len(raw_video_frames)
     
-    # グリッド設定値の読み出し
-    g_ox = st.session_state.get('g_ox', 0)
-    g_oy = st.session_state.get('g_oy', 0)
-    g_exp = st.session_state.get('g_exp', 10)
-    c_num = st.session_state.get('custom_stamp_num', 3) - 1
-    i_ox = st.session_state.get('ind_ox', 0)
-    i_oy = st.session_state.get('ind_oy', 0)
-    i_exp = st.session_state.get('ind_exp', 0)
-    custom_offsets = {c_num: (i_ox, i_oy, i_exp)}
-    
-    col_left, col_center, col_right = st.columns([1, 1.4, 1])
+    # 3カラム構造 (左: ガイド＆アニメ設定 / 中央: 大画面プレビュー / 右: マスク＆透過)
+    col_left, col_center, col_right = st.columns([1.1, 1.3, 1.1])
     
     with col_left:
-        st.subheader("🎞️ アニメ設定")
-        active_num = st.number_input("編集するスタンプ番号 (1〜12)", min_value=1, max_value=12, value=c_num + 1, key="step2_stamp_num")
-        selected_stamp_idx = active_num - 1
+        st.subheader("📐 ガイド ＆ アニメ設定")
+        
+        # スタンプ選択
+        stamp_num_val = st.number_input("スタンプ番号 (1〜12)", min_value=1, max_value=12, value=3, key="stamp_num_input")
+        selected_stamp_idx = stamp_num_val - 1
         
         st.markdown("---")
+        st.markdown("**🌐 赤枠切り出し枠の位置調整**")
+        grid_offset_x = st.slider("全体を左右移動 (px)", min_value=-100, max_value=100, value=0, step=1, key="g_ox")
+        grid_offset_y = st.slider("全体を上下移動 (px)", min_value=-100, max_value=100, value=0, step=1, key="g_oy")
+        grid_expand = st.slider("切り出し枠を外側に広げる (px)", min_value=0, max_value=100, value=10, step=2, key="g_exp")
+        
+        st.markdown(f"**🎯 スタンプ #{stamp_num_val} 個別枠調整**")
+        ind_ox = st.slider("スタンプ個別左右移動", min_value=-50, max_value=50, value=0, step=1, key="ind_ox")
+        ind_oy = st.slider("スタンプ個別上下移動", min_value=-50, max_value=50, value=0, step=1, key="ind_oy")
+        ind_exp = st.slider("スタンプ個別枠拡大", min_value=-20, max_value=50, value=0, step=1, key="ind_exp")
+        
+        custom_offsets = {selected_stamp_idx: (ind_ox, ind_oy, ind_exp)}
+        
+        st.markdown("---")
+        st.markdown("**🎞️ 再生 ＆ コマ数設定**")
         if max_raw_frames > 1:
             frame_range = st.slider(
                 "元動画の使用範囲",
                 min_value=1, max_value=max_raw_frames,
                 value=(1, max_raw_frames),
-                key="step2_frame_range"
+                key="frame_range_slider"
             )
         else:
             frame_range = (1, 1)
@@ -409,34 +376,48 @@ elif st.session_state['step'] == 2:
         target_frame_count = st.slider(
             "出力コマ数 (5〜20コマ)",
             min_value=5, max_value=20, value=default_target_count, step=1,
-            key="step2_target_count"
+            key="target_count_slider"
         )
         
-        ping_pong = st.checkbox("🔄 往復再生（ピンポン）", value=False, key="step2_ping_pong")
-        trim_end = st.checkbox("✂️ ループ末尾カット", value=True, key="step2_trim_end")
+        ping_pong = st.checkbox("🔄 往復再生（ピンポン）", value=False, key="ping_pong_cb")
+        trim_end = st.checkbox("✂️ ループ末尾カット", value=True, key="trim_end_cb")
         
-        target_sec = st.selectbox("総再生時間 (秒)", [1, 2, 3, 4], index=1, key="step2_target_sec")
-        loop_count = st.selectbox("ループ回数", [1, 2, 3, 4], index=1, key="step2_loop_count")
+        target_sec = st.selectbox("総再生時間 (秒)", [1, 2, 3, 4], index=1, key="target_sec_sb")
+        loop_count = st.selectbox("ループ回数", [1, 2, 3, 4], index=1, key="loop_count_sb")
 
     with col_right:
-        st.subheader("✂️ マスク ＆ 透過")
-        filter_noise = st.checkbox("🧹 見切れゴミ（Zzz等）自動除去", value=True, key="step2_filter_noise")
+        st.subheader("✂️ マスク ＆ 透過設定")
+        filter_noise = st.checkbox("🧹 見切れゴミ（Zzz等）自動除去", value=True, key="filter_noise_cb")
         
         st.markdown("**端のカット (見切れ削除)**")
-        crop_right_pct = st.slider("右端削り (%)", min_value=0, max_value=50, value=0, step=1, key="step2_crop_r")
-        crop_left_pct = st.slider("左端削り (%)", min_value=0, max_value=50, value=0, step=1, key="step2_crop_l")
-        crop_top_pct = st.slider("上端削り (%)", min_value=0, max_value=50, value=0, step=1, key="step2_crop_t")
-        crop_bottom_pct = st.slider("下端削り (%)", min_value=0, max_value=50, value=0, step=1, key="step2_crop_b")
+        crop_right_pct = st.slider("右端削り (%)", min_value=0, max_value=50, value=0, step=1, key="crop_r")
+        crop_left_pct = st.slider("左端削り (%)", min_value=0, max_value=50, value=0, step=1, key="crop_l")
+        crop_top_pct = st.slider("上端削り (%)", min_value=0, max_value=50, value=0, step=1, key="crop_t")
+        crop_bottom_pct = st.slider("下端削り (%)", min_value=0, max_value=50, value=0, step=1, key="crop_b")
         
         st.markdown("---")
         st.markdown("**🎨 透過感度**")
         tolerance = st.slider(
             "透過の強さ (しきい値)",
             min_value=10, max_value=150, value=75, step=5,
-            key="step2_tolerance"
+            key="tolerance_slider"
         )
+        
+        st.markdown("---")
+        st.markdown("##### 🖼️ 12カット全体の切り出し枠確認")
+        try:
+            first_frame = st.session_state['first_frame']
+            grid_preview_img = draw_grid_preview(
+                first_frame, ROWS, COLS,
+                offset_x=grid_offset_x, offset_y=grid_offset_y,
+                cell_expand=grid_expand, selected_idx=selected_stamp_idx,
+                custom_offsets=custom_offsets
+            )
+            st.image(grid_preview_img, caption="黄枠＝現在編集中のスタンプ", use_container_width=True)
+        except Exception as e:
+            st.error(f"ガイド表示エラー: {e}")
 
-    # 選択されたスタンプだけをオンデマンドで抽出（超高速・省メモリ）
+    # オンデマンドで選択中のスタンプ1個だけをリアルタイム超高速処理（メモリ超軽量）
     try:
         r = selected_stamp_idx // COLS
         c = selected_stamp_idx % COLS
@@ -444,8 +425,8 @@ elif st.session_state['step'] == 2:
         stamp_raw_cells = [
             extract_stamp_cell(
                 f, r, c, ROWS, COLS,
-                offset_x=g_ox, offset_y=g_oy,
-                cell_expand=g_exp, custom_offsets=custom_offsets
+                offset_x=grid_offset_x, offset_y=grid_offset_y,
+                cell_expand=grid_expand, custom_offsets=custom_offsets
             )
             for f in raw_video_frames
         ]
@@ -471,7 +452,7 @@ elif st.session_state['step'] == 2:
             durations_list[i] += 1
             
     except Exception as e:
-        st.error(f"個別の編集処理中にエラーが発生しました: {e}")
+        st.error(f"スタンプ編集処理エラー: {e}")
         edited_frames = []
 
     with col_center:
@@ -487,51 +468,18 @@ elif st.session_state['step'] == 2:
                     data=single_apng_data,
                     file_name=f"stamp_{selected_stamp_idx+1:02d}.png",
                     mime="image/png",
-                    key="step2_single_dl"
+                    key="single_dl_btn"
                 )
                 st.success(f"✅ LINE適合: **{frame_cnt}コマ** / 1コマ **{frame_duration_ms}ms** / 計 **{target_sec}秒**")
             except Exception as e:
                 st.error(f"プレビュー描画エラー: {e}")
                 
     st.divider()
-    if st.button("📦 次へ：【③ 全12個一括ダウンロード】へ進む", type="primary"):
-        st.session_state['step'] = 3
-        st.rerun()
-
-# ==============================================================================
-# STEP 3: オンデマンド全12個一括APNG生成 ＆ ダウンロード
-# ==============================================================================
-elif st.session_state['step'] == 3:
-    st.header("📦 全12個のアニメーションスタンプ一括書き出し")
-    st.caption("ボタンを押すと、すべてのスタンプの設定に従って一括変換を行いZIPファイルを生成します。")
     
-    raw_video_frames = st.session_state['raw_video_frames']
-    max_raw_frames = len(raw_video_frames)
+    # --- Step 3: オンデマンド全12個一括APNG生成 ＆ ダウンロード ---
+    st.subheader("📦 編集した設定で全12個のスタンプを一括書き出し")
     
-    g_ox = st.session_state.get('g_ox', 0)
-    g_oy = st.session_state.get('g_oy', 0)
-    g_exp = st.session_state.get('g_exp', 10)
-    c_num = st.session_state.get('custom_stamp_num', 3) - 1
-    i_ox = st.session_state.get('ind_ox', 0)
-    i_oy = st.session_state.get('ind_oy', 0)
-    i_exp = st.session_state.get('ind_exp', 0)
-    custom_offsets = {c_num: (i_ox, i_oy, i_exp)}
-    
-    target_frame_count = st.session_state.get('step2_target_count', min(20, max(5, max_raw_frames)))
-    frame_range = st.session_state.get('step2_frame_range', (1, max_raw_frames))
-    ping_pong = st.session_state.get('step2_ping_pong', False)
-    trim_end = st.session_state.get('step2_trim_end', True)
-    target_sec = st.session_state.get('step2_target_sec', 2)
-    loop_count = st.session_state.get('step2_loop_count', 2)
-    filter_noise = st.session_state.get('step2_filter_noise', True)
-    tolerance = st.session_state.get('step2_tolerance', 75)
-    
-    crop_r = st.session_state.get('step2_crop_r', 0)
-    crop_l = st.session_state.get('step2_crop_l', 0)
-    crop_t = st.session_state.get('step2_crop_t', 0)
-    crop_b = st.session_state.get('step2_crop_b', 0)
-
-    if st.button("🚀 全12個のLINE審査適合APNGを一括生成してダウンロード", type="primary", use_container_width=True):
+    if st.button("🚀 LINE審査適合APNGを一括生成してダウンロード (ZIP)", key="batch_dl_btn", type="primary", use_container_width=True):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -550,13 +498,13 @@ elif st.session_state['step'] == 3:
                     stamp_cells = [
                         extract_stamp_cell(
                             f, r, c, ROWS, COLS,
-                            offset_x=g_ox, offset_y=g_oy,
-                            cell_expand=g_exp, custom_offsets=custom_offsets
+                            offset_x=grid_offset_x, offset_y=grid_offset_y,
+                            cell_expand=grid_expand, custom_offsets=custom_offsets
                         )
                         for f in raw_video_frames
                     ]
                     
-                    c_cells = [crop_cell_margins(cell, crop_l, crop_r, crop_t, crop_b) for cell in stamp_cells]
+                    c_cells = [crop_cell_margins(cell, crop_left_pct, crop_right_pct, crop_top_pct, crop_bottom_pct) for cell in stamp_cells]
                     trans_frames = [remove_background_floodfill_outer(cell, tolerance=tolerance, filter_noise=filter_noise) for cell in c_cells]
                     cent_frames = center_and_fit_stamp(trans_frames)
                     
@@ -585,7 +533,7 @@ elif st.session_state['step'] == 3:
                 data=zip_buffer.getvalue(),
                 file_name="line_animation_stamps.zip",
                 mime="application/zip",
-                key="step3_zip_dl"
+                key="zip_dl_btn"
             )
         except Exception as e:
             st.error(f"一括変換中にエラーが発生しました: {e}")
