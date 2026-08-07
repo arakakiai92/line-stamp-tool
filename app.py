@@ -11,7 +11,7 @@ import gc
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="wide")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("動画解析後、プレビューを見ながら「コマ数・切り出し」「透過・マスク」「速度調整」を自由に行い、個別保存または一括ZIPダウンロードできます。")
+st.caption("元動画の全コマ（オリジナルの長さ）を100%保持。元動画の全範囲から好きな区間を自由に部分選択・トリミングできます。")
 
 # セッション状態の初期化
 if 'raw_video_frames' not in st.session_state:
@@ -24,8 +24,11 @@ if 'first_frame' not in st.session_state:
 ROWS = 3
 COLS = 4
 
-def load_and_compress_video(video_path, max_dim=800, max_frames_target=25):
-    """動画読み込み時に解像度（最大800px）とコマ数（最大25コマ）を自動圧縮してメモリ消費を1/15以下に削減する関数"""
+def load_video_full_frames(video_path, max_dim=800):
+    """
+    コマ数は一切間引かず、元動画の全フレーム（100%オリジナルの長さ）を完全に読み込みます。
+    （メモリオーバーを防ぐため解像度のみ長辺最大800pxに最適調整します）
+    """
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 10
     
@@ -40,21 +43,15 @@ def load_and_compress_video(video_path, max_dim=800, max_frames_target=25):
     if not raw_frames:
         return [], fps
         
-    total_f = len(raw_frames)
-    if total_f > max_frames_target:
-        indices = np.linspace(0, total_f - 1, max_frames_target, dtype=int)
-        sampled_frames = [raw_frames[i] for i in indices]
-    else:
-        sampled_frames = raw_frames
-        
-    h, w, _ = sampled_frames[0].shape
+    # 解像度のみ軽量化（コマ数は1コマも削らない）
+    h, w, _ = raw_frames[0].shape
     if max(h, w) > max_dim:
         scale = max_dim / float(max(h, w))
         new_w = max(1, int(w * scale))
         new_h = max(1, int(h * scale))
-        compressed_frames = [cv2.resize(f, (new_w, new_h), interpolation=cv2.INTER_AREA) for f in sampled_frames]
+        compressed_frames = [cv2.resize(f, (new_w, new_h), interpolation=cv2.INTER_AREA) for f in raw_frames]
     else:
-        compressed_frames = sampled_frames
+        compressed_frames = raw_frames
         
     del raw_frames
     gc.collect()
@@ -106,7 +103,7 @@ def draw_grid_preview(frame_bgr, rows=3, cols=4, offset_x=0, offset_y=0, cell_ex
     return cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
 
 def extract_stamp_cell(frame_bgr, r, c, rows=3, cols=4, offset_x=0, offset_y=0, cell_expand=0, custom_offsets=None):
-    """セル領域を安全に切り出す関数"""
+    """セル領域を抽出する関数"""
     h, w, _ = frame_bgr.shape
     cell_h = h // rows
     cell_w = w // cols
@@ -253,6 +250,7 @@ def center_and_fit_stamp(frame_list, target_w=320, target_h=270, padding=12):
     return centered_frames
 
 def process_frame_sequence_strict(frames, start_frame, end_frame, target_frame_count=15, ping_pong=False, trim_end=False):
+    """ユーザーが選んだ指定範囲（開始コマ〜終了コマ）から抽出し、LINEの5〜20コマへ適合変換"""
     sub = frames[start_frame - 1 : end_frame]
     if not sub:
         sub = frames
@@ -303,7 +301,7 @@ def optimize_apng_bytes(img_list, durations, loop_count):
             return data
     return data
 
-# --- Step 1: 動画のアップロード ＆ 自動圧縮ロード ---
+# --- Step 1: 動画のアップロード ＆ 全コマ100%ロード ---
 uploaded_file = st.file_uploader("1. 動画ファイル (MP4 / MOV) をアップロードしてください", type=["mp4", "mov"], key="uploader")
 
 if uploaded_file is not None:
@@ -313,15 +311,16 @@ if uploaded_file is not None:
             tfile.write(uploaded_file.read())
             temp_path = tfile.name
             
-        compressed_frames, fps = load_and_compress_video(temp_path, max_dim=800, max_frames_target=25)
+        # コマ数は間引かず、100%全フレームをロード
+        full_frames, fps = load_video_full_frames(temp_path, max_dim=800)
         st.session_state['fps'] = fps
         
         if os.path.exists(temp_path):
             os.remove(temp_path)
             
-        if compressed_frames:
-            st.session_state['raw_video_frames'] = compressed_frames
-            st.session_state['first_frame'] = compressed_frames[0]
+        if full_frames:
+            st.session_state['raw_video_frames'] = full_frames
+            st.session_state['first_frame'] = full_frames[0]
         else:
             st.error("動画フレームの読み込みに失敗しました。正しい動画ファイルかご確認ください。")
     except Exception as e:
@@ -333,40 +332,40 @@ if st.session_state.get('raw_video_frames') is not None:
     st.header("🎛️ リアルタイムスタンプ編集ワークスペース")
     
     raw_video_frames = st.session_state['raw_video_frames']
-    max_raw_frames = len(raw_video_frames)
+    total_original_frames = len(raw_video_frames) # 元動画の全コマ数
     
     col_left, col_center, col_right = st.columns([1.1, 1.3, 1.1])
     
-    # ------------------- 左カラム: 一番上に「再生コマ数＆コマ切り出し」を最優先配置 -------------------
     with col_left:
-        st.subheader("🎞️ アニメ ＆ コマ数設定")
+        st.subheader("🎞️ アニメ ＆ 部分選択設定")
         
         # 1. スタンプ選択
         stamp_num_val = st.number_input("スタンプ番号 (1〜12)", min_value=1, max_value=12, value=3, key="stamp_num_input")
         selected_stamp_idx = stamp_num_val - 1
         
-        # 2. ★最上部に優先配置★ 出力コマ数スライダー ＆ 動画使用範囲スライダー
+        # 2. 元動画の「全コマ数」からの自由な部分選択（トリミング）スライダー
         st.markdown("---")
-        st.markdown("##### ⏱️ 出力コマ数 ＆ 切り出し範囲")
+        st.markdown(f"##### ✂️ 元動画の部分選択（全 {total_original_frames} コマ）")
         
-        default_target_count = min(20, max(5, max_raw_frames))
-        target_frame_count = st.slider(
-            "出力コマ数 (5〜20コマ)",
-            min_value=5, max_value=20, value=default_target_count, step=1,
-            key="target_count_slider",
-            help="LINE規格に適合するAPNGの枚数（5〜20枚）です。"
-        )
-        
-        if max_raw_frames > 1:
+        if total_original_frames > 1:
             frame_range = st.slider(
-                "元動画の使用範囲（コマ）",
-                min_value=1, max_value=max_raw_frames,
-                value=(1, max_raw_frames),
+                f"元動画の使用区間 (1 〜 {total_original_frames} コマ)",
+                min_value=1, max_value=total_original_frames,
+                value=(1, total_original_frames),
                 key="frame_range_slider",
-                help="動きの開始・終了位置を指定します"
+                help="元の動画全体の全コマの中から、スタンプとして使いたい開始位置〜終了位置を自由に選べます。"
             )
         else:
             frame_range = (1, 1)
+
+        st.markdown("##### ⏱️ LINE出力設定")
+        default_target_count = min(20, max(5, total_original_frames))
+        target_frame_count = st.slider(
+            "LINE出力コマ数 (5〜20コマ)",
+            min_value=5, max_value=20, value=default_target_count, step=1,
+            key="target_count_slider",
+            help="部分選択された動画から、LINE規格（5〜20枚）に変換される最終コマ数です。"
+        )
 
         ping_pong = st.checkbox("🔄 往復再生（ピンポン）", value=False, key="ping_pong_cb")
         trim_end = st.checkbox("✂️ ループ末尾カット", value=True, key="trim_end_cb")
@@ -378,7 +377,7 @@ if st.session_state.get('raw_video_frames') is not None:
         with col_loop:
             loop_count = st.selectbox("ループ回数", [1, 2, 3, 4], index=1, key="loop_count_sb")
 
-        # 3. 赤枠グリッド調整（折りたたみ Expander に収納してパネル最上部をスッキリ化！）
+        # 3. 赤枠グリッド調整
         st.markdown("---")
         with st.expander("📐 赤枠グリッド微調整 (全体のズレ・個別枠拡大)", expanded=False):
             grid_offset_x = st.slider("全体を左右移動 (px)", min_value=-100, max_value=100, value=0, step=1, key="g_ox")
@@ -424,11 +423,12 @@ if st.session_state.get('raw_video_frames') is not None:
             except Exception as e:
                 st.error(f"ガイド表示エラー: {e}")
 
-    # オンデマンド抽出
+    # 元動画の指定区間（1コマ〜全コマ）をユーザー指定に従って処理
     try:
         r = selected_stamp_idx // COLS
         c = selected_stamp_idx % COLS
         
+        # 1. 元動画の全コマから抽出
         stamp_raw_cells = [
             extract_stamp_cell(
                 f, r, c, ROWS, COLS,
@@ -442,6 +442,7 @@ if st.session_state.get('raw_video_frames') is not None:
         trans_frames = [remove_background_floodfill_outer(cell, tolerance=tolerance, filter_noise=filter_noise) for cell in cropped_cells]
         centered_frames = center_and_fit_stamp(trans_frames)
         
+        # 2. ユーザーが選んだ部分範囲（frame_range: 開始コマ〜終了コマ）を切り出してからLINE規定コマ数に変換
         edited_frames = process_frame_sequence_strict(
             centered_frames, frame_range[0], frame_range[1],
             target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
@@ -467,7 +468,7 @@ if st.session_state.get('raw_video_frames') is not None:
         if edited_frames:
             try:
                 preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
-                st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} | {frame_cnt}コマ / {target_sec}秒 ({loop_count}回再生)", use_container_width=True)
+                st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} | 選択区間: コマ#{frame_range[0]}〜#{frame_range[1]} (全{total_original_frames}コマ中) ➔ 出力: {frame_cnt}コマ", use_container_width=True)
                 
                 single_apng_data = optimize_apng_bytes(edited_frames, durations_list, loop_count)
                 st.download_button(
