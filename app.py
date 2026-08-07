@@ -10,92 +10,15 @@ import tempfile
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="wide")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("動画全体の12分割ガイドラインを「赤枠グリッド」で視覚確認しながら、見切れが出ないよう全体・個別の切り出し範囲を完璧に合わせられます。")
+st.caption("動画解析後、中央プレビューを見ながら両サイドの操作バーで「切り出し」「マスク」「透過」を自在に調整できます。")
 
-# セッション状態の初期化
 if 'raw_stamps' not in st.session_state:
     st.session_state['raw_stamps'] = None
 if 'fps' not in st.session_state:
     st.session_state['fps'] = 10
-if 'first_frame' not in st.session_state:
-    st.session_state['first_frame'] = None
-if 'raw_video_frames' not in st.session_state:
-    st.session_state['raw_video_frames'] = None
 
 ROWS = 3
 COLS = 4
-
-def draw_grid_preview(frame_bgr, rows=3, cols=4, offset_x=0, offset_y=0, cell_expand=0, selected_idx=0, custom_offsets=None):
-    """動画の第1フレーム上に3x4グリッド枠（赤・黄）を描画して視覚的に確認する関数"""
-    h, w, _ = frame_bgr.shape
-    preview = frame_bgr.copy()
-    
-    cell_h = h // rows
-    cell_w = w // cols
-    
-    if custom_offsets is None:
-        custom_offsets = {}
-        
-    for r in range(rows):
-        for c in range(cols):
-            idx = r * cols + c
-            
-            x1 = c * cell_w + offset_x
-            y1 = r * cell_h + offset_y
-            x2 = (c + 1) * cell_w + offset_x
-            y2 = (r + 1) * cell_h + offset_y
-            
-            c_ox, c_oy, c_exp = custom_offsets.get(idx, (0, 0, 0))
-            x1 += c_ox - (cell_expand + c_exp)
-            y1 += c_oy - (cell_expand + c_exp)
-            x2 += c_ox + (cell_expand + c_exp)
-            y2 += c_oy + (cell_expand + c_exp)
-            
-            x1_c = max(0, min(w - 1, int(x1)))
-            y1_c = max(0, min(h - 1, int(y1)))
-            x2_c = max(0, min(w - 1, int(x2)))
-            y2_c = max(0, min(h - 1, int(y2)))
-            
-            if selected_idx is not None and idx == selected_idx:
-                color = (0, 255, 255) # 黄色（選択中のスタンプ）
-                thickness = 3
-            else:
-                color = (0, 0, 255) # 赤色
-                thickness = 2
-                
-            cv2.rectangle(preview, (x1_c, y1_c), (x2_c, y2_c), color, thickness)
-            cv2.putText(preview, f"#{idx+1}", (x1_c + 8, y1_c + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
-            cv2.putText(preview, f"#{idx+1}", (x1_c + 8, y1_c + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-            
-    return cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-
-def extract_stamp_cell(frame_bgr, r, c, rows=3, cols=4, offset_x=0, offset_y=0, cell_expand=0, custom_offsets=None):
-    """調整されたグリッド座標に従ってセル領域をクロップ抽出する関数"""
-    h, w, _ = frame_bgr.shape
-    cell_h = h // rows
-    cell_w = w // cols
-    idx = r * cols + c
-    
-    x1 = c * cell_w + offset_x
-    y1 = r * cell_h + offset_y
-    x2 = (c + 1) * cell_w + offset_x
-    y2 = (r + 1) * cell_h + offset_y
-    
-    if custom_offsets is None:
-        custom_offsets = {}
-        
-    c_ox, c_oy, c_exp = custom_offsets.get(idx, (0, 0, 0))
-    x1 += c_ox - (cell_expand + c_exp)
-    y1 += c_oy - (cell_expand + c_exp)
-    x2 += c_ox + (cell_expand + c_exp)
-    y2 += c_oy + (cell_expand + c_exp)
-    
-    x1_c = max(0, min(w - 1, int(x1)))
-    y1_c = max(0, min(h - 1, int(y1)))
-    x2_c = max(x1_c + 1, min(w, int(x2)))
-    y2_c = max(y1_c + 1, min(h, int(y2)))
-    
-    return frame_bgr[y1_c:y2_c, x1_c:x2_c]
 
 def crop_cell_margins(cell_bgr, crop_left_pct=0, crop_right_pct=0, crop_top_pct=0, crop_bottom_pct=0):
     """画面端の不要な見切れ領域をカットする関数"""
@@ -271,105 +194,67 @@ def optimize_apng_bytes(img_list, durations, loop_count):
             return data
     return data
 
-# --- Step 1: 動画のアップロード ＆ フレームロード ---
+# --- Step 1: 動画のアップロード ＆ 解析 ---
 uploaded_file = st.file_uploader("1. 動画ファイル (MP4 / MOV) をアップロードしてください", type=["mp4", "mov"])
 
 if uploaded_file is not None:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
-        uploaded_file.seek(0)
-        tfile.write(uploaded_file.read())
-        temp_path = tfile.name
-        
-    cap = cv2.VideoCapture(temp_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 10
-    st.session_state['fps'] = fps
-    
-    raw_frames = []
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        raw_frames.append(frame)
-    cap.release()
-    
-    if os.path.exists(temp_path):
-        os.remove(temp_path)
-        
-    if raw_frames:
-        st.session_state['raw_video_frames'] = raw_frames
-        st.session_state['first_frame'] = raw_frames[0]
-    else:
-        st.error("動画フレームの読み込みに失敗しました。正しい動画ファイルかご確認ください。")
+    if st.button("🔍 動画を解析して編集画面へ進む"):
+        with st.spinner("動画のコマ分割処理中..."):
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
+                    uploaded_file.seek(0)
+                    tfile.write(uploaded_file.read())
+                    temp_path = tfile.name
+                    
+                cap = cv2.VideoCapture(temp_path)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 10
+                st.session_state['fps'] = fps
+                
+                raw_frames = []
+                while cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    raw_frames.append(frame)
+                cap.release()
+                
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                    
+                if raw_frames:
+                    h, w, _ = raw_frames[0].shape
+                    cell_h, cell_w = h // ROWS, w // COLS
+                    raw_stamps = {i: [] for i in range(12)}
+                    
+                    for frame in raw_frames:
+                        for r in range(ROWS):
+                            for c in range(COLS):
+                                idx = r * COLS + c
+                                cell = frame[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w]
+                                raw_stamps[idx].append(cell)
+                                
+                    st.session_state['raw_stamps'] = raw_stamps
+                    st.success("解析が完了しました！下部の編集エリアで調整を行ってください。")
+                else:
+                    st.error("動画フレームの読み込みに失敗しました。正しい動画ファイルかご確認ください。")
+            except Exception as e:
+                st.error(f"解析中にエラーが発生しました: {e}")
 
-# --- Step 2: 視覚的グリッド調整エリア (切り出し枠のリアルタイム調整) ---
-if st.session_state.get('raw_video_frames') is not None:
-    st.divider()
-    st.header("📐 12カット自動切り出し枠（赤枠グリッド）の視覚調整")
-    st.caption("動画全体の12コマ切り出し範囲を画面上で視覚的に調整できます。キャラクターが見切れないよう赤枠の幅や位置をあわせてください。")
-    
-    col_grid_img, col_grid_ctrl = st.columns([1.5, 1])
-    
-    with col_grid_ctrl:
-        st.subheader("⚙️ グリッド位置・枠サイズの調整")
-        
-        st.markdown("**🌐 全体の枠ずらし ＆ 拡大**")
-        grid_offset_x = st.slider("全体を左右に移動 (px)", min_value=-100, max_value=100, value=0, step=1)
-        grid_offset_y = st.slider("全体を上下に移動 (px)", min_value=-100, max_value=100, value=0, step=1)
-        grid_expand = st.slider("切り出し枠を外側に広げる (px)", min_value=0, max_value=100, value=10, step=2, help="枠を広げることで、動きが大きいキャラの見切れをまとめて防止できます")
-        
-        st.markdown("---")
-        st.markdown("**🎯 特定スタンプ個別の位置調整 (微調整)**")
-        custom_target_idx = st.number_input("位置を微調整するスタンプ番号 (1〜12)", min_value=1, max_value=12, value=3) - 1
-        
-        ind_ox = st.slider(f"スタンプ #{custom_target_idx+1} の左右移動", min_value=-50, max_value=50, value=0, step=1)
-        ind_oy = st.slider(f"スタンプ #{custom_target_idx+1} の上下移動", min_value=-50, max_value=50, value=0, step=1)
-        ind_exp = st.slider(f"スタンプ #{custom_target_idx+1} の枠個別拡大", min_value=-20, max_value=50, value=0, step=1)
-        
-        custom_offsets = {custom_target_idx: (ind_ox, ind_oy, ind_exp)}
-        
-        if st.button("🚀 この切り出し枠でスタンプ編集画面へ進む", type="primary"):
-            raw_video_frames = st.session_state['raw_video_frames']
-            raw_stamps = {i: [] for i in range(12)}
-            
-            for frame in raw_video_frames:
-                for r in range(ROWS):
-                    for c in range(COLS):
-                        idx = r * COLS + c
-                        cell = extract_stamp_cell(
-                            frame, r, c, ROWS, COLS,
-                            offset_x=grid_offset_x, offset_y=grid_offset_y,
-                            cell_expand=grid_expand, custom_offsets=custom_offsets
-                        )
-                        raw_stamps[idx].append(cell)
-                        
-            st.session_state['raw_stamps'] = raw_stamps
-            st.success("切り出し枠を反映しました！下部のプレビューエリアで編集を行ってください。")
-
-    with col_grid_img:
-        st.subheader("🖼️ 切り出し枠の確認（黄色枠＝調整中のスタンプ）")
-        first_frame = st.session_state['first_frame']
-        grid_preview_img = draw_grid_preview(
-            first_frame, ROWS, COLS,
-            offset_x=grid_offset_x, offset_y=grid_offset_y,
-            cell_expand=grid_expand, selected_idx=custom_target_idx,
-            custom_offsets=custom_offsets
-        )
-        st.image(grid_preview_img, caption="赤枠・黄枠が自動切り出しの範囲です", use_column_width=True)
-
-# --- Step 3: 3カラム編集ワークスペース（プレビュー ＆ 高度編集） ---
-if st.session_state.get('raw_stamps') is not None:
+# --- Step 2: 3カラム（左: アニメ設定 / 中央: 大画面プレビュー / 右: マスク・透過） ---
+if st.session_state['raw_stamps'] is not None:
     st.divider()
     st.header("🎛️ 3画面 リアルタイムスタンプ編集ワークスペース")
     
     raw_stamps_data = st.session_state['raw_stamps']
     max_raw_frames = max(1, len(raw_stamps_data.get(0, [])))
     
+    # 画面を横いっぱいに使い 1 : 1.4 : 1 の3カラムに分割
     col_left, col_center, col_right = st.columns([1, 1.4, 1])
     
     # ------------------- 左カラム: アニメーション＆タイムライン -------------------
     with col_left:
         st.subheader("🎞️ アニメ設定")
-        selected_stamp_idx = st.number_input("確認・編集するスタンプ番号 (1〜12)", min_value=1, max_value=12, value=custom_target_idx + 1) - 1
+        selected_stamp_idx = st.number_input("スタンプ番号 (1〜12)", min_value=1, max_value=12, value=1) - 1
         
         st.markdown("---")
         if max_raw_frames > 1:
@@ -400,7 +285,7 @@ if st.session_state.get('raw_stamps') is not None:
         filter_noise = st.checkbox("🧹 見切れゴミ（Zzz等）自動除去", value=True)
         
         st.markdown("**端のカット (見切れ削除)**")
-        crop_right_pct = st.slider("右端削り (%)", min_value=0, max_value=50, value=0, step=1)
+        crop_right_pct = st.slider("右端削り (%)", min_value=0, max_value=50, value=15, step=1)
         crop_left_pct = st.slider("左端削り (%)", min_value=0, max_value=50, value=0, step=1)
         crop_top_pct = st.slider("上端削り (%)", min_value=0, max_value=50, value=0, step=1)
         crop_bottom_pct = st.slider("下端削り (%)", min_value=0, max_value=50, value=0, step=1)
@@ -452,7 +337,7 @@ if st.session_state.get('raw_stamps') is not None:
         
     st.divider()
     
-    # --- Step 4: 全スタンプ一括出力 ---
+    # --- Step 3: 全スタンプ一括出力 ---
     st.subheader("📦 編集した設定で全12個のスタンプを一括書き出し")
     
     if st.button("🚀 LINE審査適合APNGを一括ダウンロード (ZIP)"):
