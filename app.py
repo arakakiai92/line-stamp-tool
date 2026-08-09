@@ -11,9 +11,8 @@ import gc
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="wide")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("元動画の全コマを保持。画質優先（フルカラー）と容量優先（自動圧縮）を自由に切り替えて保存できます。")
+st.caption("元動画の全コマを保持。リサイズ・ぼかしなしの【高画質・等倍キープモード】でPhotoshop用素材をそのまま綺麗に書き出せます。")
 
-# セッション状態の初期化
 if 'raw_video_frames' not in st.session_state:
     st.session_state['raw_video_frames'] = None
 if 'fps' not in st.session_state:
@@ -21,10 +20,8 @@ if 'fps' not in st.session_state:
 if 'first_frame' not in st.session_state:
     st.session_state['first_frame'] = None
 
-ROWS = 3
-COLS = 4
-
-def load_video_full_frames(video_path, max_dim=800):
+def load_video_full_frames(video_path, max_dim=1200):
+    """元動画の全コマを100%保持しつつ、高画質を維持したまま読み込む関数"""
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 10
     
@@ -39,12 +36,13 @@ def load_video_full_frames(video_path, max_dim=800):
     if not raw_frames:
         return [], fps
         
+    # 高画質維持のため最大1200pxまでに設定（またはそのまま）
     h, w, _ = raw_frames[0].shape
     if max(h, w) > max_dim:
         scale = max_dim / float(max(h, w))
         new_w = max(1, int(w * scale))
         new_h = max(1, int(h * scale))
-        compressed_frames = [cv2.resize(f, (new_w, new_h), interpolation=cv2.INTER_AREA) for f in raw_frames]
+        compressed_frames = [cv2.resize(f, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4) for f in raw_frames]
     else:
         compressed_frames = raw_frames
         
@@ -159,7 +157,8 @@ def remove_isolated_noise_alpha(alpha_channel, min_size_pct=0.015):
             
     return new_alpha
 
-def remove_background_floodfill_outer(cell_bgr, tolerance=70, filter_noise=True):
+def remove_background_floodfill_sharp(cell_bgr, tolerance=70, filter_noise=True, sharp_edge=True):
+    """輪郭をぼかさずクッキリシャープに背景透過する関数"""
     h, w, _ = cell_bgr.shape
     if h < 5 or w < 5:
         return Image.fromarray(cv2.cvtColor(cell_bgr, cv2.COLOR_BGR2RGBA))
@@ -195,52 +194,14 @@ def remove_background_floodfill_outer(cell_bgr, tolerance=70, filter_noise=True)
     if filter_noise:
         alpha = remove_isolated_noise_alpha(alpha)
         
-    alpha_blurred = cv2.GaussianBlur(alpha, (3, 3), 0)
-    _, alpha_smoothed = cv2.threshold(alpha_blurred, 127, 255, cv2.THRESH_BINARY)
+    # sharp_edgeがTrueならボカシを完全にかけずにパキッとした輪郭を維持
+    if not sharp_edge:
+        alpha_blurred = cv2.GaussianBlur(alpha, (3, 3), 0)
+        _, alpha = cv2.threshold(alpha_blurred, 127, 255, cv2.THRESH_BINARY)
     
     b, g, r = cv2.split(cell_bgr)
-    cell_bgra = cv2.merge([b, g, r, alpha_smoothed])
+    cell_bgra = cv2.merge([b, g, r, alpha])
     return Image.fromarray(cv2.cvtColor(cell_bgra, cv2.COLOR_BGRA2RGBA))
-
-def center_and_fit_stamp(frame_list, target_w=320, target_h=270, padding=12):
-    if not frame_list:
-        return frame_list
-        
-    alphas = [np.array(img)[:, :, 3] for img in frame_list]
-    stacked_alpha = np.maximum.reduce(alphas)
-    non_zeros = np.argwhere(stacked_alpha > 10)
-    
-    if non_zeros.size == 0:
-        return [img.resize((target_w, target_h), Image.Resampling.LANCZOS) for img in frame_list]
-        
-    min_y, min_x = non_zeros.min(axis=0)
-    max_y, max_x = non_zeros.max(axis=0)
-    
-    h_orig, w_orig = stacked_alpha.shape
-    min_x = max(0, min_x - padding)
-    min_y = max(0, min_y - padding)
-    max_x = min(w_orig - 1, max_x + padding)
-    max_y = min(h_orig - 1, max_y + padding)
-    
-    crop_w = max_x - min_x + 1
-    crop_h = max_y - min_y + 1
-    
-    scale = min(target_w / crop_w, target_h / crop_h)
-    new_w = max(1, int(round(crop_w * scale)))
-    new_h = max(1, int(round(crop_h * scale)))
-    
-    offset_x = (target_w - new_w) // 2
-    offset_y = (target_h - new_h) // 2
-    
-    centered_frames = []
-    for img in frame_list:
-        cropped = img.crop((min_x, min_y, max_x + 1, max_y + 1))
-        resized = cropped.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
-        canvas.paste(resized, (offset_x, offset_y), mask=resized)
-        centered_frames.append(canvas)
-        
-    return centered_frames
 
 def process_frame_sequence_strict(frames, start_frame, end_frame, target_frame_count=15, ping_pong=False, trim_end=False):
     sub = frames[start_frame - 1 : end_frame]
@@ -271,35 +232,20 @@ def create_preview_gif(frame_list, duration_ms):
     )
     return buf.getvalue()
 
-def optimize_apng_bytes(img_list, durations, loop_count, quality_mode="画質優先（フルカラー維持）"):
+def export_apng_lossless(img_list, durations, loop_count):
+    """減色や圧縮を一切行わず、フルカラー無劣化のままAPNGバイト列を生成する関数"""
     buf = io.BytesIO()
     img_list[0].save(
-        buf, format="PNG", save_all=True,
-        append_images=img_list[1:], duration=durations, loop=loop_count
+        buf,
+        format="PNG",
+        save_all=True,
+        append_images=img_list[1:],
+        duration=durations,
+        loop=loop_count
     )
-    data = buf.getvalue()
-    
-    # 画質優先の場合は減色せずフルカラーのまま返す
-    if "画質優先" in quality_mode:
-        return data
-        
-    # 容量優先（自動軽量化）の場合
-    if len(data) < 990000:
-        return data
-        
-    for colors in [256, 128, 64, 32]:
-        quantized_imgs = [img.quantize(colors=colors, method=Image.Quantize.FASTOCTREE).convert("RGBA") for img in img_list]
-        buf = io.BytesIO()
-        quantized_imgs[0].save(
-            buf, format="PNG", save_all=True,
-            append_images=quantized_imgs[1:], duration=durations, loop=loop_count
-        )
-        data = buf.getvalue()
-        if len(data) < 990000:
-            return data
-    return data
+    return buf.getvalue()
 
-# --- Step 1: 動画のアップロード ---
+# --- Step 1: 動画アップロード ---
 uploaded_file = st.file_uploader("1. 動画ファイル (MP4 / MOV) をアップロードしてください", type=["mp4", "mov"], key="uploader")
 
 if uploaded_file is not None:
@@ -309,7 +255,7 @@ if uploaded_file is not None:
             tfile.write(uploaded_file.read())
             temp_path = tfile.name
             
-        full_frames, fps = load_video_full_frames(temp_path, max_dim=800)
+        full_frames, fps = load_video_full_frames(temp_path, max_dim=1200)
         st.session_state['fps'] = fps
         
         if os.path.exists(temp_path):
@@ -351,7 +297,7 @@ if st.session_state.get('raw_video_frames') is not None:
     total_stamps = st.session_state.get('total_stamps', 12)
     
     st.divider()
-    st.header("🎛️ リアルタイムスタンプ編集ワークスペース")
+    st.header("🎛️ 高画質・等倍キープ 編集ワークスペース")
     
     raw_video_frames = st.session_state['raw_video_frames']
     total_original_frames = len(raw_video_frames)
@@ -377,10 +323,10 @@ if st.session_state.get('raw_video_frames') is not None:
         else:
             frame_range = (1, 1)
 
-        st.markdown("##### ⏱️ LINE出力設定")
+        st.markdown("##### ⏱️ 出力フレーム設定")
         default_target_count = min(20, max(5, total_original_frames))
         target_frame_count = st.slider(
-            "LINE出力コマ数 (5〜20コマ)",
+            "出力コマ数 (5〜20コマ)",
             min_value=5, max_value=20, value=default_target_count, step=1,
             key="target_count_slider"
         )
@@ -409,19 +355,9 @@ if st.session_state.get('raw_video_frames') is not None:
         custom_offsets = {selected_stamp_idx: (ind_ox, ind_oy, ind_exp)}
 
     with col_right:
-        st.subheader("🎨 画質 ＆ マスク設定")
-        
-        # ★ 画質モードの選択肢（高画質保存対応） ★
-        quality_mode = st.radio(
-            "保存画質モード",
-            ["🎨 画質優先（フルカラー維持・減色なし）", "📦 容量優先（LINE 1MB以下に自動圧縮）"],
-            index=0,
-            key="quality_mode_radio",
-            help="「画質優先」を選ぶと、色数が減らされずオリジナルの美しい高画質で保存できます（※LINE申請時に1MBを超える場合は容量優先をお使いください）。"
-        )
-        
-        st.markdown("---")
+        st.subheader("✂️ マスク ＆ 画質設定")
         filter_noise = st.checkbox("🧹 見切れゴミ（Zzz等）自動除去", value=True, key="filter_noise_cb")
+        sharp_edge = st.checkbox("🔪 輪郭をぼかさずクッキリ保つ (シャープ透過)", value=True, key="sharp_edge_cb", help="オンにするとエッジのボカシを行わず、Photoshop用にパキッとした輪郭を維持します")
         
         st.markdown("**端のカット (見切れ削除)**")
         crop_right_pct = st.slider("右端削り (%)", min_value=0, max_value=50, value=0, step=1, key="crop_r")
@@ -465,8 +401,13 @@ if st.session_state.get('raw_video_frames') is not None:
         ]
         
         cropped_cells = [crop_cell_margins(cell, crop_left_pct, crop_right_pct, crop_top_pct, crop_bottom_pct) for cell in stamp_raw_cells]
-        trans_frames = [remove_background_floodfill_outer(cell, tolerance=tolerance, filter_noise=filter_noise) for cell in cropped_cells]
-        centered_frames = center_and_fit_stamp(trans_frames)
+        
+        # 輪郭をぼかさないシャープ透過処理を適用
+        trans_frames = [remove_background_floodfill_sharp(cell, tolerance=tolerance, filter_noise=filter_noise, sharp_edge=sharp_edge) for cell in cropped_cells]
+        
+        # リサイズなし（切り出しサイズ等のまま等倍キープ）
+        # ※ center_and_fit_stampの代わりに等倍維持のリスト作成
+        centered_frames = trans_frames 
         
         edited_frames = process_frame_sequence_strict(
             centered_frames, frame_range[0], frame_range[1],
@@ -493,17 +434,18 @@ if st.session_state.get('raw_video_frames') is not None:
         if edited_frames:
             try:
                 preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
-                st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} | 選択区間: コマ#{frame_range[0]}〜#{frame_range[1]} (全{total_original_frames}コマ中) ➔ 出力: {frame_cnt}コマ", use_container_width=True)
+                st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} | 等倍無劣化・{frame_cnt}コマ / {target_sec}秒", use_container_width=True)
                 
-                single_apng_data = optimize_apng_bytes(edited_frames, durations_list, loop_count, quality_mode=quality_mode)
+                # 完全無劣化のフルカラーAPNGバイト列を出力
+                single_apng_data = export_apng_lossless(edited_frames, durations_list, loop_count)
                 st.download_button(
-                    label=f"💾 スタンプ #{selected_stamp_idx + 1} を個別ダウンロード (APNG)",
+                    label=f"💾 スタンプ #{selected_stamp_idx + 1} を無劣化個別ダウンロード (APNG)",
                     data=single_apng_data,
                     file_name=f"stamp_{selected_stamp_idx+1:02d}.png",
                     mime="image/png",
                     key="single_dl_btn"
                 )
-                st.success(f"✅ LINE適合: **{frame_cnt}コマ** / 1コマ **{frame_duration_ms}ms** / 計 **{target_sec}秒**")
+                st.success(f"✨ **等倍無劣化モード稼働中**: 全{frame_cnt}コマ / 1コマ **{frame_duration_ms}ms**")
             except Exception as e:
                 st.error(f"プレビュー描画エラー: {e}")
                 
@@ -512,7 +454,7 @@ if st.session_state.get('raw_video_frames') is not None:
     # --- Step 3: 全カット一括書き出し ---
     st.subheader(f"📦 編集した設定で全 {total_stamps} 個のスタンプを一括書き出し")
     
-    if st.button(f"🚀 LINE審査適合APNGを全 {total_stamps} 個一括生成してダウンロード (ZIP)", key="batch_dl_btn", type="primary", use_container_width=True):
+    if st.button(f"🚀 無劣化フルカラーAPNGを全 {total_stamps} 個一括生成してダウンロード (ZIP)", key="batch_dl_btn", type="primary", use_container_width=True):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -523,7 +465,7 @@ if st.session_state.get('raw_video_frames') is not None:
             
             with zipfile.ZipFile(zip_buffer, "w") as zip_file:
                 for idx in range(total_stamps):
-                    status_text.text(f"スタンプ #{idx+1}/{total_stamps} を高画質透過処理・APNG変換中...")
+                    status_text.text(f"スタンプ #{idx+1}/{total_stamps} を無劣化フルカラーでAPNG変換中...")
                     
                     r = idx // COLS
                     c = idx % COLS
@@ -538,11 +480,11 @@ if st.session_state.get('raw_video_frames') is not None:
                     ]
                     
                     c_cells = [crop_cell_margins(cell, crop_left_pct, crop_right_pct, crop_top_pct, crop_bottom_pct) for cell in stamp_cells]
-                    trans_frames = [remove_background_floodfill_outer(cell, tolerance=tolerance, filter_noise=filter_noise) for cell in c_cells]
-                    cent_frames = center_and_fit_stamp(trans_frames)
+                    trans_frames = [remove_background_floodfill_sharp(cell, tolerance=tolerance, filter_noise=filter_noise, sharp_edge=sharp_edge) for cell in c_cells]
+                    cent_frames = trans_frames
                     
                     proc_f = process_frame_sequence_strict(
-                        centered_frames, frame_range[0], frame_range[1],
+                        cent_frames, frame_range[0], frame_range[1],
                         target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
                     )
                     
@@ -553,13 +495,13 @@ if st.session_state.get('raw_video_frames') is not None:
                     for i in range(remainder):
                         durations_list[i] += 1
                         
-                    apng_data = optimize_apng_bytes(proc_f, durations_list, loop_count, quality_mode=quality_mode)
+                    apng_data = export_apng_lossless(proc_f, durations_list, loop_count)
                     zip_file.writestr(f"stamp_{idx+1:02d}.png", apng_data)
                     
                     progress_bar.progress((idx + 1) / total_stamps)
                     
             status_text.text("🎉 すべての変換が完了しました！")
-            st.success(f"🎉 全 {total_stamps} 個のアニメーションスタンプの生成が完了しました！")
+            st.success(f"🎉 全 {total_stamps} 個の無劣化アニメーションスタンプの生成が完了しました！")
             
             st.download_button(
                 label="📦 一括ダウンロード (ZIP)",
