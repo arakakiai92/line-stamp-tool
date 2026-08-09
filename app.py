@@ -11,7 +11,7 @@ import gc
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="wide")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("12カット（4×3）または6カット（3×2）のグリッド分割を選択して、元動画の全コマから自由に作成できます。")
+st.caption("元動画の全コマを保持。画質優先（フルカラー）と容量優先（自動圧縮）を自由に切り替えて保存できます。")
 
 # セッション状態の初期化
 if 'raw_video_frames' not in st.session_state:
@@ -21,8 +21,10 @@ if 'fps' not in st.session_state:
 if 'first_frame' not in st.session_state:
     st.session_state['first_frame'] = None
 
+ROWS = 3
+COLS = 4
+
 def load_video_full_frames(video_path, max_dim=800):
-    """コマ数は間引かず、元動画の全フレーム（100%オリジナルの長さ）を完全に読み込む関数"""
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 10
     
@@ -52,7 +54,6 @@ def load_video_full_frames(video_path, max_dim=800):
     return compressed_frames, fps
 
 def draw_grid_preview(frame_bgr, rows, cols, offset_x=0, offset_y=0, cell_expand=0, selected_idx=0, custom_offsets=None):
-    """動画フレーム上にグリッド枠を描画"""
     h, w, _ = frame_bgr.shape
     preview = frame_bgr.copy()
     
@@ -83,10 +84,10 @@ def draw_grid_preview(frame_bgr, rows, cols, offset_x=0, offset_y=0, cell_expand
             y2_c = max(y1_c + 1, min(h, int(y2)))
             
             if selected_idx is not None and idx == selected_idx:
-                color = (0, 255, 255) # 黄色
+                color = (0, 255, 255)
                 thickness = 3
             else:
-                color = (0, 0, 255) # 赤色
+                color = (0, 0, 255)
                 thickness = 2
                 
             cv2.rectangle(preview, (x1_c, y1_c), (x2_c, y2_c), color, thickness)
@@ -96,7 +97,6 @@ def draw_grid_preview(frame_bgr, rows, cols, offset_x=0, offset_y=0, cell_expand
     return cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
 
 def extract_stamp_cell(frame_bgr, r, c, rows, cols, offset_x=0, offset_y=0, cell_expand=0, custom_offsets=None):
-    """指定されたグリッド行・列からセルを抽出する関数"""
     h, w, _ = frame_bgr.shape
     cell_h = h // rows
     cell_w = w // cols
@@ -271,17 +271,23 @@ def create_preview_gif(frame_list, duration_ms):
     )
     return buf.getvalue()
 
-def optimize_apng_bytes(img_list, durations, loop_count):
+def optimize_apng_bytes(img_list, durations, loop_count, quality_mode="画質優先（フルカラー維持）"):
     buf = io.BytesIO()
     img_list[0].save(
         buf, format="PNG", save_all=True,
         append_images=img_list[1:], duration=durations, loop=loop_count
     )
     data = buf.getvalue()
+    
+    # 画質優先の場合は減色せずフルカラーのまま返す
+    if "画質優先" in quality_mode:
+        return data
+        
+    # 容量優先（自動軽量化）の場合
     if len(data) < 990000:
         return data
         
-    for colors in [128, 64, 32]:
+    for colors in [256, 128, 64, 32]:
         quantized_imgs = [img.quantize(colors=colors, method=Image.Quantize.FASTOCTREE).convert("RGBA") for img in img_list]
         buf = io.BytesIO()
         quantized_imgs[0].save(
@@ -293,7 +299,7 @@ def optimize_apng_bytes(img_list, durations, loop_count):
             return data
     return data
 
-# --- Step 1: 動画のアップロード ＆ 全コマ100%ロード ---
+# --- Step 1: 動画のアップロード ---
 uploaded_file = st.file_uploader("1. 動画ファイル (MP4 / MOV) をアップロードしてください", type=["mp4", "mov"], key="uploader")
 
 if uploaded_file is not None:
@@ -317,7 +323,6 @@ if uploaded_file is not None:
     except Exception as e:
         st.error(f"動画ロード中にエラーが発生しました: {e}")
 
-# グリッドレイアウトの選択（12カット 4x3 または 6カット 3x2）
 if st.session_state.get('raw_video_frames') is not None:
     st.markdown("---")
     st.subheader("📐 分割レイアウトの選択")
@@ -367,8 +372,7 @@ if st.session_state.get('raw_video_frames') is not None:
                 f"元動画の使用区間 (1 〜 {total_original_frames} コマ)",
                 min_value=1, max_value=total_original_frames,
                 value=(1, total_original_frames),
-                key="frame_range_slider",
-                help="元の動画全体の全コマの中から、スタンプとして使いたい開始位置〜終了位置を自由に選べます。"
+                key="frame_range_slider"
             )
         else:
             frame_range = (1, 1)
@@ -378,8 +382,7 @@ if st.session_state.get('raw_video_frames') is not None:
         target_frame_count = st.slider(
             "LINE出力コマ数 (5〜20コマ)",
             min_value=5, max_value=20, value=default_target_count, step=1,
-            key="target_count_slider",
-            help="部分選択された動画から、LINE規格（5〜20枚）に変換される最終コマ数です。"
+            key="target_count_slider"
         )
 
         ping_pong = st.checkbox("🔄 往復再生（ピンポン）", value=False, key="ping_pong_cb")
@@ -406,7 +409,18 @@ if st.session_state.get('raw_video_frames') is not None:
         custom_offsets = {selected_stamp_idx: (ind_ox, ind_oy, ind_exp)}
 
     with col_right:
-        st.subheader("✂️ マスク ＆ 透過設定")
+        st.subheader("🎨 画質 ＆ マスク設定")
+        
+        # ★ 画質モードの選択肢（高画質保存対応） ★
+        quality_mode = st.radio(
+            "保存画質モード",
+            ["🎨 画質優先（フルカラー維持・減色なし）", "📦 容量優先（LINE 1MB以下に自動圧縮）"],
+            index=0,
+            key="quality_mode_radio",
+            help="「画質優先」を選ぶと、色数が減らされずオリジナルの美しい高画質で保存できます（※LINE申請時に1MBを超える場合は容量優先をお使いください）。"
+        )
+        
+        st.markdown("---")
         filter_noise = st.checkbox("🧹 見切れゴミ（Zzz等）自動除去", value=True, key="filter_noise_cb")
         
         st.markdown("**端のカット (見切れ削除)**")
@@ -481,7 +495,7 @@ if st.session_state.get('raw_video_frames') is not None:
                 preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
                 st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} | 選択区間: コマ#{frame_range[0]}〜#{frame_range[1]} (全{total_original_frames}コマ中) ➔ 出力: {frame_cnt}コマ", use_container_width=True)
                 
-                single_apng_data = optimize_apng_bytes(edited_frames, durations_list, loop_count)
+                single_apng_data = optimize_apng_bytes(edited_frames, durations_list, loop_count, quality_mode=quality_mode)
                 st.download_button(
                     label=f"💾 スタンプ #{selected_stamp_idx + 1} を個別ダウンロード (APNG)",
                     data=single_apng_data,
@@ -539,7 +553,7 @@ if st.session_state.get('raw_video_frames') is not None:
                     for i in range(remainder):
                         durations_list[i] += 1
                         
-                    apng_data = optimize_apng_bytes(proc_f, durations_list, loop_count)
+                    apng_data = optimize_apng_bytes(proc_f, durations_list, loop_count, quality_mode=quality_mode)
                     zip_file.writestr(f"stamp_{idx+1:02d}.png", apng_data)
                     
                     progress_bar.progress((idx + 1) / total_stamps)
