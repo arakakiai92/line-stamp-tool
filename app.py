@@ -6,12 +6,13 @@ import io
 import zipfile
 import os
 import tempfile
+import traceback
 import gc
 
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="wide")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("均等グリッド分割に加え、不均等配置・余白・見切れ動画に対応した【自動領域検出モード】搭載版です。")
+st.caption("見切れボツカット自動除外＆不均等レイアウト対応【超軽量・オンデマンド処理版】")
 
 if 'video_path' not in st.session_state:
     st.session_state['video_path'] = None
@@ -25,31 +26,50 @@ if 'video_h' not in st.session_state:
     st.session_state['video_h'] = 600
 if 'is_vertical' not in st.session_state:
     st.session_state['is_vertical'] = False
+if 'custom_offsets_dict' not in st.session_state:
+    st.session_state['custom_offsets_dict'] = {}
 
-# --- 領域自動検出関数 ---
-def detect_content_boxes(frame_bgr, min_area_pct=0.03, filter_cut_edges=False):
+# --- 見切れボツカット自動除外付き 領域検出 ---
+def detect_content_boxes_robust(frame_bgr, auto_filter_cut=True):
     h, w, _ = frame_bgr.shape
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     
-    # 白背景（>235）以外のコンテンツ領域を抽出
+    # 白背景（>235）以外の領域を抽出
     non_bg = (gray < 235).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     closed = cv2.morphologyEx(non_bg, cv2.MORPH_CLOSE, kernel)
     
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed)
-    boxes = []
-    min_area = h * w * min_area_pct
+    raw_boxes = []
+    min_area = h * w * 0.02  # 画面の2%以上
     
     for i in range(1, num_labels):
         x, y, bw, bh, area = stats[i]
-        if area >= min_area and bw > 30 and bh > 30:
-            if filter_cut_edges:
-                # 画面の左右端（見切れ）に接触している要素を除外
-                if x <= 5 or (x + bw) >= (w - 5):
-                    continue
-            boxes.append((int(x), int(y), int(bw), int(bh)))
+        if area >= min_area and bw > 40 and bh > 40:
+            raw_boxes.append((int(x), int(y), int(bw), int(bh)))
             
-    # 左から右、上から下の順にソート
+    if not raw_boxes:
+        return []
+        
+    if auto_filter_cut:
+        # 1. 画面の端（余白8px未満）に触れている見切れを除外
+        complete_boxes = []
+        for x, y, bw, bh in raw_boxes:
+            is_edge_cut = (x <= 8) or ((x + bw) >= (w - 8)) or (y <= 8) or ((y + bh) >= (h - 8))
+            if not is_edge_cut:
+                complete_boxes.append((x, y, bw, bh))
+                
+        # 2. 完全な枠が見つかった場合は幅の極端な違い（細すぎる枠）も排除
+        if len(complete_boxes) > 0:
+            median_w = np.median([b[2] for b in complete_boxes])
+            filtered = [b for b in complete_boxes if b[2] >= median_w * 0.7]
+            boxes = filtered if filtered else complete_boxes
+        else:
+            boxes = raw_boxes
+    else:
+        boxes = raw_boxes
+        
+    # 左から右、上から下の順に整列
     boxes.sort(key=lambda b: (b[1] // 50, b[0]))
     return boxes
 
@@ -70,14 +90,12 @@ if uploaded_file is not None:
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 600
         cap.release()
         
-        is_vertical = h > w
-        
         st.session_state['fps'] = fps
         st.session_state['total_frames'] = total_f
         st.session_state['video_path'] = temp_path
         st.session_state['video_w'] = w
         st.session_state['video_h'] = h
-        st.session_state['is_vertical'] = is_vertical
+        st.session_state['is_vertical'] = (h > w)
         
         gc.collect()
     except Exception as e:
@@ -85,7 +103,9 @@ if uploaded_file is not None:
 
 # 分割レイアウトの選択
 boxes_list = []
-is_auto_detect = False
+is_auto_detect = True
+total_stamps = 0
+ROWS, COLS = 1, 2
 
 if st.session_state.get('video_path') is not None:
     w = st.session_state['video_w']
@@ -96,82 +116,69 @@ if st.session_state.get('video_path') is not None:
     st.markdown("---")
     st.subheader("📐 分割レイアウトの選択")
     
-    if is_vertical:
-        st.info(f"📱 **縦構図動画** を検出（解像度: {w} × {h}）")
-        default_options = [
-            "🤖 白枠・イラスト領域を自動検出 (推奨)",
-            "6カット (2列 × 3行)",
-            "8カット (2列 × 4行)",
-            "4カット (2列 × 2行)",
-            "カスタムグリッド指定"
-        ]
-    else:
-        st.info(f"🖥️ **横構図動画** を検出（解像度: {w} × {h}）")
-        default_options = [
-            "🤖 白枠・イラスト領域を自動検出 (推奨)",
-            "10カット (5列 × 2行)",
-            "12カット (4列 × 3行)",
-            "6カット (2列 × 3行)",
-            "カスタムグリッド指定"
-        ]
+    default_options = [
+        "🤖 自動領域検出（見切れボツカットを自動除外）",
+        "均等 6カット (2列 × 3行)",
+        "均等 8カット (2列 × 4行)",
+        "均等 10カット (5列 × 2行)",
+        "カスタム均等グリッド指定"
+    ]
 
     grid_mode = st.radio(
-        "動画の切り出しレイアウトを選択してください",
+        "切り出しレイアウトを選択してください",
         default_options,
+        index=0,
         horizontal=True,
         key="grid_mode_radio"
     )
     
-    if "自動検出" in grid_mode:
+    if "自動領域検出" in grid_mode:
         is_auto_detect = True
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            filter_cut = st.checkbox("左右の端で見切れている不完全な枠を除外する（完全な中央2枚のみ抽出）", value=False)
-        with col_f2:
-            min_area_val = st.slider("検出最小サイズ比率 (%)", min_value=1, max_value=20, value=3, step=1)
-            
+        include_cut_edges = st.checkbox("端の見切れボツカットも含めてすべて抽出する（通常はOFFのままでOK）", value=False)
+        
         cap_first = cv2.VideoCapture(video_path)
         ret_f, first_frame = cap_first.read()
         cap_first.release()
         
         if ret_f:
-            boxes_list = detect_content_boxes(first_frame, min_area_pct=min_area_val/100.0, filter_cut_edges=filter_cut)
+            boxes_list = detect_content_boxes_robust(first_frame, auto_filter_cut=(not include_cut_edges))
             total_stamps = len(boxes_list)
-            st.success(f"🎯 **{total_stamps} 個** のカード領域を自動検出しました！")
+            st.success(f"🎯 **有効なカード {total_stamps} 個** を自動検出しました！（見切れカットは自動除外済み）")
         else:
             boxes_list = []
             total_stamps = 0
     else:
         is_auto_detect = False
-        if "10カット" in grid_mode:
-            ROWS, COLS = 2, 5
-        elif "12カット" in grid_mode:
-            ROWS, COLS = 3, 4
+        if "6カット" in grid_mode:
+            ROWS, COLS = 3, 2
         elif "8カット" in grid_mode:
             ROWS, COLS = 4, 2
-        elif "6カット" in grid_mode:
-            ROWS, COLS = 3, 2
-        elif "4カット" in grid_mode:
-            ROWS, COLS = 2, 2
+        elif "10カット" in grid_mode:
+            ROWS, COLS = 2, 5
         else:
             col_c, col_r = st.columns(2)
             with col_c:
-                COLS = st.number_input("横の列数 (Columns)", min_value=1, max_value=10, value=2 if is_vertical else 5, step=1)
+                COLS = st.number_input("横の列数", min_value=1, max_value=10, value=2 if is_vertical else 4, step=1)
             with col_r:
-                ROWS = st.number_input("縦の行数 (Rows)", min_value=1, max_value=10, value=4 if is_vertical else 2, step=1)
+                ROWS = st.number_input("縦の行数", min_value=1, max_value=10, value=3 if is_vertical else 1, step=1)
         total_stamps = ROWS * COLS
-        st.session_state['ROWS'] = ROWS
-        st.session_state['COLS'] = COLS
 
     st.session_state['total_stamps'] = total_stamps
+    st.session_state['boxes_list'] = boxes_list
+    st.session_state['is_auto_detect'] = is_auto_detect
+    st.session_state['ROWS'] = ROWS
+    st.session_state['COLS'] = COLS
 
-# --- 切り出し処理 ---
+# --- 座標計算関数 ---
 def get_stamp_crop_coords(idx, frame_shape, is_auto, boxes, rows, cols, offset_x, offset_y, cell_expand, custom_offsets):
     h_f, w_f = frame_shape[:2]
     c_ox, c_oy, c_exp = custom_offsets.get(idx, (0, 0, 0))
     
-    if is_auto and idx < len(boxes):
-        bx, by, bw, bh = boxes[idx]
+    if is_auto:
+        if idx < len(boxes):
+            bx, by, bw, bh = boxes[idx]
+        else:
+            bx, by, bw, bh = 0, 0, w_f, h_f
         x1 = bx + offset_x + c_ox - (cell_expand + c_exp)
         y1 = by + offset_y + c_oy - (cell_expand + c_exp)
         x2 = bx + bw + offset_x + c_ox + (cell_expand + c_exp)
@@ -195,61 +202,43 @@ def get_stamp_crop_coords(idx, frame_shape, is_auto, boxes, rows, cols, offset_x
 def load_stamp_frames(video_path, start_f, end_f, idx, is_auto, boxes, rows, cols, offset_x, offset_y, cell_expand, custom_offsets):
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, start_f - 1))
-    extracted_frames = []
-    current_f = start_f
-    
-    while current_f <= end_f and cap.isOpened():
+    extracted = []
+    curr = start_f
+    while curr <= end_f and cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
         x1, y1, x2, y2 = get_stamp_crop_coords(idx, frame.shape, is_auto, boxes, rows, cols, offset_x, offset_y, cell_expand, custom_offsets)
-        extracted_frames.append(frame[y1:y2, x1:x2])
-        current_f += 1
-        
+        extracted.append(frame[y1:y2, x1:x2])
+        curr += 1
     cap.release()
     gc.collect()
-    return extracted_frames
+    return extracted
 
 def draw_preview_boxes(frame_bgr, is_auto, boxes, rows, cols, offset_x=0, offset_y=0, cell_expand=0, selected_idx=0, custom_offsets=None):
     preview = frame_bgr.copy()
     if custom_offsets is None:
         custom_offsets = {}
-        
     total = len(boxes) if is_auto else (rows * cols)
     for idx in range(total):
         x1, y1, x2, y2 = get_stamp_crop_coords(idx, frame_bgr.shape, is_auto, boxes, rows, cols, offset_x, offset_y, cell_expand, custom_offsets)
         color = (0, 255, 255) if idx == selected_idx else (0, 0, 255)
         thickness = 3 if idx == selected_idx else 2
         cv2.rectangle(preview, (x1, y1), (x2, y2), color, thickness)
-        cv2.putText(preview, f"#{idx+1}", (x1 + 8, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
-        cv2.putText(preview, f"#{idx+1}", (x1 + 8, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-        
+        cv2.putText(preview, f"#{idx+1}", (x1 + 10, y1 + 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4)
+        cv2.putText(preview, f"#{idx+1}", (x1 + 10, y1 + 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
     return cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
 
-def crop_cell_margins(cell_bgr, crop_left_pct=0, crop_right_pct=0, crop_top_pct=0, crop_bottom_pct=0):
+def crop_cell_margins(cell_bgr, crop_l=0, crop_r=0, crop_t=0, crop_b=0):
     h, w, _ = cell_bgr.shape
-    top = int(h * crop_top_pct / 100.0)
-    bottom = h - int(h * crop_bottom_pct / 100.0)
-    left = int(w * crop_left_pct / 100.0)
-    right = w - int(w * crop_right_pct / 100.0)
+    top = int(h * crop_t / 100.0)
+    bottom = h - int(h * crop_b / 100.0)
+    left = int(w * crop_l / 100.0)
+    right = w - int(w * crop_r / 100.0)
     if bottom <= top + 10: bottom = top + 10
     if right <= left + 10: right = left + 10
     return cell_bgr[top:bottom, left:right]
 
-def remove_isolated_noise_alpha(alpha_channel, min_size_pct=0.015):
-    h, w = alpha_channel.shape
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((alpha_channel > 127).astype(np.uint8))
-    if num_labels <= 2: return alpha_channel
-    new_alpha = np.zeros_like(alpha_channel)
-    areas = [(i, stats[i, cv2.CC_STAT_AREA]) for i in range(1, num_labels)]
-    areas.sort(key=lambda x: x[1], reverse=True)
-    new_alpha[labels == areas[0][0]] = 255
-    min_area = (h * w) * min_size_pct
-    for idx, area in areas[1:]:
-        if area >= min_area: new_alpha[labels == idx] = 255
-    return new_alpha
-
-def remove_background_floodfill_sharp(cell_bgr, tolerance=70, filter_noise=True, sharp_edge=True):
+def remove_background_floodfill(cell_bgr, tolerance=70, filter_noise=True, sharp_edge=True):
     h, w, _ = cell_bgr.shape
     if h < 5 or w < 5: return Image.fromarray(cv2.cvtColor(cell_bgr, cv2.COLOR_BGR2RGBA))
     mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
@@ -271,7 +260,6 @@ def remove_background_floodfill_sharp(cell_bgr, tolerance=70, filter_noise=True,
                 cv2.floodFill(img_work, mask, seedPoint=(seed_x, seed_y), newVal=(0, 0, 0), loDiff=lo_diff, upDiff=up_diff, flags=flags)
     bg_mask = mask[1:h+1, 1:w+1]
     alpha = np.where(bg_mask == 255, 0, 255).astype(np.uint8)
-    if filter_noise: alpha = remove_isolated_noise_alpha(alpha)
     if not sharp_edge:
         alpha = cv2.threshold(cv2.GaussianBlur(alpha, (3, 3), 0), 127, 255, cv2.THRESH_BINARY)[1]
     b, g, r = cv2.split(cell_bgr)
@@ -301,8 +289,6 @@ def export_apng_lossless(img_list, durations, loop_count):
 
 # --- ワークスペース ---
 if st.session_state.get('video_path') is not None and total_stamps > 0:
-    ROWS = st.session_state.get('ROWS', 2)
-    COLS = st.session_state.get('COLS', 5)
     total_original_frames = st.session_state.get('total_frames', 30)
     video_path = st.session_state['video_path']
     
@@ -313,16 +299,29 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
     
     with col_left:
         st.subheader("🎞️ アニメ ＆ 部分選択設定")
-        stamp_num_val = st.selectbox("編集するスタンプ番号を選択", options=list(range(1, total_stamps + 1)), format_func=lambda x: f"スタンプ #{x}", key="stamp_selectbox")
+        
+        stamp_options = list(range(1, total_stamps + 1))
+        # セレクトボックスの値安全確保
+        if 'cur_stamp_num' not in st.session_state or st.session_state['cur_stamp_num'] not in stamp_options:
+            st.session_state['cur_stamp_num'] = stamp_options[0]
+            
+        stamp_num_val = st.selectbox(
+            "編集するスタンプ番号を選択",
+            options=stamp_options,
+            format_func=lambda x: f"スタンプ #{x}",
+            index=stamp_options.index(st.session_state['cur_stamp_num']),
+            key="stamp_selectbox"
+        )
+        st.session_state['cur_stamp_num'] = stamp_num_val
         selected_stamp_idx = stamp_num_val - 1
         
         st.markdown("---")
-        st.markdown(f"##### ✂️ 動画の部分選択（全 {total_original_frames} コマ）")
-        frame_range = st.slider("使用区間", min_value=1, max_value=max(1, total_original_frames), value=(1, max(1, total_original_frames)), key="frame_range_slider")
+        st.markdown(f"##### ✂️ 再生区間設定（全 {total_original_frames} コマ）")
+        frame_range = st.slider("コマ区間", min_value=1, max_value=max(1, total_original_frames), value=(1, max(1, total_original_frames)), key="frame_range_slider")
 
         st.markdown("##### ⏱️ LINE出力設定")
-        target_frame_count = st.slider("LINE出力コマ数 (5〜20コマ)", min_value=5, max_value=20, value=min(20, max(5, total_original_frames)), step=1, key="target_count_slider")
-        ping_pong = st.checkbox("🔄 往復再生（ピンポン）", value=False, key="ping_pong_cb")
+        target_frame_count = st.slider("出力コマ数 (5〜20コマ)", min_value=5, max_value=20, value=min(20, max(5, total_original_frames)), step=1, key="target_count_slider")
+        ping_pong = st.checkbox("🔄 往復再生（ピンポン再生）", value=False, key="ping_pong_cb")
         trim_end = st.checkbox("✂️ ループ末尾カット", value=True, key="trim_end_cb")
         
         st.markdown("---")
@@ -334,33 +333,40 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
 
         st.markdown("---")
         with st.expander("📐 位置・余白微調整", expanded=False):
-            grid_offset_x = st.slider("全体を左右移動 (px)", -100, 100, 0, 1, key="g_ox")
-            grid_offset_y = st.slider("全体を上下移動 (px)", -100, 100, 0, 1, key="g_oy")
-            grid_expand = st.slider("切り出し枠拡大 (px)", 0, 100, 0, 2, key="g_exp")
+            grid_offset_x = st.slider("全体左右移動 (px)", -100, 100, 0, 1, key="g_ox")
+            grid_offset_y = st.slider("全体上下移動 (px)", -100, 100, 0, 1, key="g_oy")
+            grid_expand = st.slider("切り出し枠拡大 (px)", -20, 100, 0, 2, key="g_exp")
             
             st.markdown(f"**スタンプ #{stamp_num_val} 個別微調整**")
             ind_ox = st.slider("個別左右移動", -50, 50, 0, 1, key="ind_ox")
             ind_oy = st.slider("個別上下移動", -50, 50, 0, 1, key="ind_oy")
             ind_exp = st.slider("個別枠拡大", -30, 50, 0, 1, key="ind_exp")
             
-        custom_offsets = {selected_stamp_idx: (ind_ox, ind_oy, ind_exp)}
+        st.session_state['custom_offsets_dict'][selected_stamp_idx] = (ind_ox, ind_oy, ind_exp)
+        custom_offsets = st.session_state['custom_offsets_dict']
 
     with col_right:
-        st.subheader("✂️ マスク ＆ 画質設定")
-        filter_noise = st.checkbox("🧹 ゴミ自動除去", value=True, key="filter_noise_cb")
-        sharp_edge = st.checkbox("🔪 シャープ透過", value=True, key="sharp_edge_cb")
+        st.subheader("✂️ 透過 ＆ マスク設定")
         
-        st.markdown("**端のカット (黒枠・外枠除去)**")
-        crop_right_pct = st.slider("右端削り (%)", 0, 30, 0, 1, key="crop_r")
-        crop_left_pct = st.slider("左端削り (%)", 0, 30, 0, 1, key="crop_l")
-        crop_top_pct = st.slider("上端削り (%)", 0, 30, 0, 1, key="crop_t")
-        crop_bottom_pct = st.slider("下端削り (%)", 0, 30, 0, 1, key="crop_b")
+        # 風景カードと透過スタンプ両対応
+        use_transparency = st.checkbox("🎨 白背景を透過する", value=False, help="チェックを外すと、四角い風景カードとしてそのままフルカラー出力されます。")
+        
+        if use_transparency:
+            tolerance = st.slider("透過感度 (しきい値)", 10, 150, 75, 5, key="tolerance_slider")
+            sharp_edge = st.checkbox("🔪 シャープ透過（輪郭クッキリ）", value=True, key="sharp_edge_cb")
+        else:
+            tolerance = 0
+            sharp_edge = True
+            
+        st.markdown("---")
+        st.markdown("**カード端の削り (枠線の除去用)**")
+        crop_r = st.slider("右端削り (%)", 0, 30, 0, 1, key="crop_r")
+        crop_l = st.slider("左端削り (%)", 0, 30, 0, 1, key="crop_l")
+        crop_t = st.slider("上端削り (%)", 0, 30, 0, 1, key="crop_t")
+        crop_b = st.slider("下端削り (%)", 0, 30, 0, 1, key="crop_b")
         
         st.markdown("---")
-        tolerance = st.slider("透過の強さ (背景が白い場合はこのままでOK)", 0, 150, 75, 5, key="tolerance_slider")
-        
-        st.markdown("---")
-        with st.expander(f"🖼️ 全 {total_stamps} カットの切り出し枠確認", expanded=True):
+        with st.expander(f"🖼️ 切り出し枠の確認（全 {total_stamps} 個）", expanded=True):
             try:
                 cap_first = cv2.VideoCapture(video_path)
                 ret_f, first_frame = cap_first.read()
@@ -372,7 +378,7 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
                         cell_expand=grid_expand, selected_idx=selected_stamp_idx,
                         custom_offsets=custom_offsets
                     )
-                    st.image(grid_preview_img, caption="黄枠＝現在選択中のスタンプ", use_container_width=True)
+                    st.image(grid_preview_img, caption="黄枠＝現在編集中のスタンプ", use_container_width=True)
             except Exception as e:
                 st.error(f"ガイド表示エラー: {e}")
 
@@ -384,11 +390,15 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
             grid_offset_x, grid_offset_y, grid_expand, custom_offsets
         )
         
-        cropped_cells = [crop_cell_margins(cell, crop_left_pct, crop_right_pct, crop_top_pct, crop_bottom_pct) for cell in stamp_raw_cells]
-        trans_frames = [remove_background_floodfill_sharp(cell, tolerance=tolerance, filter_noise=filter_noise, sharp_edge=sharp_edge) for cell in cropped_cells]
+        cropped_cells = [crop_cell_margins(cell, crop_l, crop_r, crop_t, crop_b) for cell in stamp_raw_cells]
         
+        if use_transparency:
+            processed_frames = [remove_background_floodfill(cell, tolerance=tolerance, sharp_edge=sharp_edge) for cell in cropped_cells]
+        else:
+            processed_frames = [Image.fromarray(cv2.cvtColor(cell, cv2.COLOR_BGR2RGBA)) for cell in cropped_cells]
+            
         edited_frames = process_frame_sequence_strict(
-            trans_frames, target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
+            processed_frames, target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
         )
         
         total_ms = target_sec * 1000
@@ -404,6 +414,7 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
             
     except Exception as e:
         st.error(f"スタンプ編集処理エラー: {e}")
+        st.code(traceback.format_exc())
         edited_frames = []
 
     with col_center:
@@ -411,26 +422,26 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
         if edited_frames:
             try:
                 preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
-                st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} | 区間: #{frame_range[0]}〜#{frame_range[1]} コマ ➔ 出力: {frame_cnt}コマ", use_container_width=True)
+                st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} | コマ数: {frame_cnt}コマ / 1コマ {frame_duration_ms}ms", use_container_width=True)
                 
                 single_apng_data = export_apng_lossless(edited_frames, durations_list, loop_count)
                 st.download_button(
-                    label=f"💾 スタンプ #{selected_stamp_idx + 1} を無劣化個別ダウンロード (APNG)",
+                    label=f"💾 スタンプ #{selected_stamp_idx + 1} をダウンロード (APNG)",
                     data=single_apng_data,
                     file_name=f"stamp_{selected_stamp_idx+1:02d}.png",
                     mime="image/png",
                     key="single_dl_btn"
                 )
-                st.success(f"✨ 全{frame_cnt}コマ / 1コマ **{frame_duration_ms}ms**")
+                st.success(f"✨ 正常稼働中: 全{frame_cnt}コマ (1コマあたり {frame_duration_ms}ms)")
             except Exception as e:
                 st.error(f"プレビュー描画エラー: {e}")
                 
     st.divider()
     
     # --- 一括書き出し ---
-    st.subheader(f"📦 全 {total_stamps} 個のスタンプを一括書き出し")
+    st.subheader(f"📦 有効な全 {total_stamps} 個のスタンプを一括書き出し")
     
-    if st.button(f"🚀 無劣化フルカラーAPNGを全 {total_stamps} 個一括生成してダウンロード (ZIP)", key="batch_dl_btn", type="primary", use_container_width=True):
+    if st.button(f"🚀 有効な全 {total_stamps} 個を一括生成してダウンロード (ZIP)", key="batch_dl_btn", type="primary", use_container_width=True):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -441,7 +452,7 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
             
             with zipfile.ZipFile(zip_buffer, "w") as zip_file:
                 for idx in range(total_stamps):
-                    status_text.text(f"スタンプ #{idx+1}/{total_stamps} を無劣化フルカラーでAPNG変換中...")
+                    status_text.text(f"スタンプ #{idx+1}/{total_stamps} を高画質変換中...")
                     
                     stamp_cells = load_stamp_frames(
                         video_path, frame_range[0], frame_range[1], idx,
@@ -449,10 +460,14 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
                         grid_offset_x, grid_offset_y, grid_expand, custom_offsets
                     )
                     
-                    c_cells = [crop_cell_margins(cell, crop_left_pct, crop_right_pct, crop_top_pct, crop_bottom_pct) for cell in stamp_cells]
-                    trans_frames = [remove_background_floodfill_sharp(cell, tolerance=tolerance, filter_noise=filter_noise, sharp_edge=sharp_edge) for cell in c_cells]
+                    c_cells = [crop_cell_margins(cell, crop_l, crop_r, crop_t, crop_b) for cell in stamp_cells]
+                    if use_transparency:
+                        p_frames = [remove_background_floodfill(cell, tolerance=tolerance, sharp_edge=sharp_edge) for cell in c_cells]
+                    else:
+                        p_frames = [Image.fromarray(cv2.cvtColor(cell, cv2.COLOR_BGR2RGBA)) for cell in c_cells]
+                        
                     proc_f = process_frame_sequence_strict(
-                        trans_frames, target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
+                        p_frames, target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
                     )
                     
                     f_cnt = len(proc_f)
@@ -467,7 +482,7 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
                     progress_bar.progress((idx + 1) / total_stamps)
                     
             status_text.text("🎉 すべての変換が完了しました！")
-            st.success(f"🎉 全 {total_stamps} 個の無劣化アニメーションスタンプの生成が完了しました！")
+            st.success(f"🎉 有効な全 {total_stamps} 個のスタンプ生成が完了しました！")
             st.download_button(
                 label="📦 一括ダウンロード (ZIP)",
                 data=zip_buffer.getvalue(),
@@ -477,3 +492,4 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
             )
         except Exception as e:
             st.error(f"一括変換中にエラーが発生しました: {e}")
+            st.code(traceback.format_exc())
