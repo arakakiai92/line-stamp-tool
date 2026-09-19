@@ -12,7 +12,7 @@ import gc
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="wide")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("見切れボツカット自動除外＆不均等レイアウト対応【16:9横長・多分割対応版】")
+st.caption("見切れボツカット自動除外＆不均等レイアウト対応【超省メモリ・16:9最適化版】")
 
 if 'video_path' not in st.session_state:
     st.session_state['video_path'] = None
@@ -29,12 +29,11 @@ if 'is_vertical' not in st.session_state:
 if 'custom_offsets_dict' not in st.session_state:
     st.session_state['custom_offsets_dict'] = {}
 
-# --- 見切れボツカット自動除外付き 領域検出（16:9・多分割対応） ---
+# --- 見切れボツカット自動除外付き 領域検出 ---
 def detect_content_boxes_robust(frame_bgr, auto_filter_cut=True):
     h, w, _ = frame_bgr.shape
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     
-    # 白背景（>235）以外の領域を抽出
     non_bg = (gray < 235).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     closed = cv2.morphologyEx(non_bg, cv2.MORPH_CLOSE, kernel)
@@ -42,9 +41,9 @@ def detect_content_boxes_robust(frame_bgr, auto_filter_cut=True):
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed)
     raw_boxes = []
     
-    # 12分割以上にも対応できるよう最小面積を緩和 (画面全体の0.8%以上)
+    # 画面全体の0.8%以上（多分割対応）
     min_area = h * w * 0.008
-    min_dim = min(w, h) * 0.04  # 最小サイズも解像度基準に動的化
+    min_dim = min(w, h) * 0.04
     
     for i in range(1, num_labels):
         x, y, bw, bh, area = stats[i]
@@ -55,10 +54,9 @@ def detect_content_boxes_robust(frame_bgr, auto_filter_cut=True):
         return []
         
     if auto_filter_cut:
-        # 画面の端（余白5px以下）に触れている見切れを除外
         complete_boxes = []
         for x, y, bw, bh in raw_boxes:
-            is_edge_cut = (x <= 5) or ((x + bw) >= (w - 5)) or (y <= 5) or ((y + bh) >= (h - 5))
+            is_edge_cut = (x <= 6) or ((x + bw) >= (w - 6)) or (y <= 6) or ((y + bh) >= (h - 6))
             if not is_edge_cut:
                 complete_boxes.append((x, y, bw, bh))
                 
@@ -74,20 +72,25 @@ def detect_content_boxes_robust(frame_bgr, auto_filter_cut=True):
     if not boxes:
         return []
 
-    # 行判定のしきい値をスタンプ平均高さの半分に動的設定（上から下・左から右へ確実に整列）
     avg_h = np.mean([b[3] for b in boxes])
     row_bin = max(20, int(avg_h * 0.6))
     boxes.sort(key=lambda b: (b[1] // row_bin, b[0]))
     return boxes
 
-# --- 動画のロード ---
+# --- 動画のロード（省メモリ版） ---
 uploaded_file = st.file_uploader("1. 動画ファイル (MP4 / MOV) をアップロードしてください", type=["mp4", "mov"], key="uploader")
 
 if uploaded_file is not None:
+    # 既存の一時ファイルがあれば削除してメモリ解放
+    if st.session_state.get('video_path') and os.path.exists(st.session_state['video_path']):
+        try:
+            os.remove(st.session_state['video_path'])
+        except:
+            pass
+            
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
-            uploaded_file.seek(0)
-            tfile.write(uploaded_file.read())
+            tfile.write(uploaded_file.getbuffer())
             temp_path = tfile.name
             
         cap = cv2.VideoCapture(temp_path)
@@ -212,19 +215,34 @@ def get_stamp_crop_coords(idx, frame_shape, is_auto, boxes, rows, cols, offset_x
     y2_c = max(y1_c + 10, min(h_f, int(y2)))
     return x1_c, y1_c, x2_c, y2_c
 
-def load_stamp_frames(video_path, start_f, end_f, idx, is_auto, boxes, rows, cols, offset_x, offset_y, cell_expand, custom_offsets):
+# 【超省メモリ】必要なコマだけをスキップしながらピンポイント読み出し
+def load_stamp_frames_optimized(video_path, start_f, end_f, idx, is_auto, boxes, rows, cols, offset_x, offset_y, cell_expand, custom_offsets, target_count=15):
+    total_range = max(1, end_f - start_f + 1)
+    
+    # 必要なフレーム番号だけをあらかじめ計算（全コマ保持を避ける）
+    sample_frames = np.linspace(start_f, end_f, min(total_range, target_count * 2), dtype=int)
+    sample_frames_set = set(sample_frames)
+
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, start_f - 1))
+    
     extracted = []
     curr = start_f
     while curr <= end_f and cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
-        x1, y1, x2, y2 = get_stamp_crop_coords(idx, frame.shape, is_auto, boxes, rows, cols, offset_x, offset_y, cell_expand, custom_offsets)
-        extracted.append(frame[y1:y2, x1:x2])
+        if curr in sample_frames_set:
+            x1, y1, x2, y2 = get_stamp_crop_coords(idx, frame.shape, is_auto, boxes, rows, cols, offset_x, offset_y, cell_expand, custom_offsets)
+            cropped = frame[y1:y2, x1:x2]
+            
+            # メモリ節約：LINEスタンプの最大サイズ(320px)に合わせて縮小保持
+            ch, cw = cropped.shape[:2]
+            if cw > 320 or ch > 270:
+                scale = min(320.0 / cw, 270.0 / ch)
+                cropped = cv2.resize(cropped, (int(cw * scale), int(ch * scale)), interpolation=cv2.INTER_AREA)
+            extracted.append(cropped)
         curr += 1
     cap.release()
-    gc.collect()
     return extracted
 
 def draw_preview_boxes(frame_bgr, is_auto, boxes, rows, cols, offset_x=0, offset_y=0, cell_expand=0, selected_idx=0, custom_offsets=None):
@@ -239,6 +257,11 @@ def draw_preview_boxes(frame_bgr, is_auto, boxes, rows, cols, offset_x=0, offset
         cv2.rectangle(preview, (x1, y1), (x2, y2), color, thickness)
         cv2.putText(preview, f"#{idx+1}", (x1 + 8, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3)
         cv2.putText(preview, f"#{idx+1}", (x1 + 8, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        
+    # プレビュー表示用に軽くリサイズ
+    ph, pw = preview.shape[:2]
+    if pw > 1000:
+        preview = cv2.resize(preview, (1000, int(ph * 1000 / pw)), interpolation=cv2.INTER_AREA)
     return cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
 
 def crop_cell_margins(cell_bgr, crop_l=0, crop_r=0, crop_t=0, crop_b=0):
@@ -329,10 +352,12 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
         
         st.markdown("---")
         st.markdown(f"##### ✂️ 再生区間設定（全 {total_original_frames} コマ）")
-        frame_range = st.slider("コマ区間", min_value=1, max_value=max(1, total_original_frames), value=(1, max(1, total_original_frames)), key="frame_range_slider")
+        # デフォルトは長すぎないように先頭30コマ程度に抑えて初期化
+        default_end = min(total_original_frames, 40)
+        frame_range = st.slider("コマ区間", min_value=1, max_value=max(1, total_original_frames), value=(1, default_end), key="frame_range_slider")
 
         st.markdown("##### ⏱️ LINE出力設定")
-        target_frame_count = st.slider("出力コマ数 (5〜20コマ)", min_value=5, max_value=20, value=min(20, max(5, total_original_frames)), step=1, key="target_count_slider")
+        target_frame_count = st.slider("出力コマ数 (5〜20コマ)", min_value=5, max_value=20, value=12, step=1, key="target_count_slider")
         ping_pong = st.checkbox("🔄 往復再生（ピンポン再生）", value=False, key="ping_pong_cb")
         trim_end = st.checkbox("✂️ ループ末尾カット", value=True, key="trim_end_cb")
         
@@ -360,7 +385,7 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
     with col_right:
         st.subheader("✂️ 透過 ＆ マスク設定")
         
-        use_transparency = st.checkbox("🎨 白背景を透過する", value=True, help="チェックを外すと、背景白のままフルカラー出力されます。")
+        use_transparency = st.checkbox("🎨 白背景を透過する", value=True, help="チェックを外すと背景白のまま出力されます。")
         
         if use_transparency:
             tolerance = st.slider("透過感度 (しきい値)", 10, 150, 75, 5, key="tolerance_slider")
@@ -394,10 +419,11 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
                 st.error(f"ガイド表示エラー: {e}")
 
     try:
-        stamp_raw_cells = load_stamp_frames(
+        stamp_raw_cells = load_stamp_frames_optimized(
             video_path, frame_range[0], frame_range[1], selected_stamp_idx,
             is_auto_detect, boxes_list, ROWS, COLS,
-            grid_offset_x, grid_offset_y, grid_expand, custom_offsets
+            grid_offset_x, grid_offset_y, grid_expand, custom_offsets,
+            target_count=target_frame_count
         )
         
         cropped_cells = [crop_cell_margins(cell, crop_l, crop_r, crop_t, crop_b) for cell in stamp_raw_cells]
@@ -448,7 +474,7 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
                 
     st.divider()
     
-    # --- 一括書き出し ---
+    # --- 一括書き出し（省メモリ順次処理） ---
     st.subheader(f"📦 有効な全 {total_stamps} 個のスタンプを一括書き出し")
     
     if st.button(f"🚀 有効な全 {total_stamps} 個を一括生成してダウンロード (ZIP)", key="batch_dl_btn", type="primary", use_container_width=True):
@@ -464,10 +490,11 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
                 for idx in range(total_stamps):
                     status_text.text(f"スタンプ #{idx+1}/{total_stamps} を高画質変換中...")
                     
-                    stamp_cells = load_stamp_frames(
+                    stamp_cells = load_stamp_frames_optimized(
                         video_path, frame_range[0], frame_range[1], idx,
                         is_auto_detect, boxes_list, ROWS, COLS,
-                        grid_offset_x, grid_offset_y, grid_expand, custom_offsets
+                        grid_offset_x, grid_offset_y, grid_expand, custom_offsets,
+                        target_count=target_frame_count
                     )
                     
                     c_cells = [crop_cell_margins(cell, crop_l, crop_r, crop_t, crop_b) for cell in stamp_cells]
@@ -489,6 +516,11 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
                         
                     apng_data = export_apng_lossless(proc_f, d_list, loop_count)
                     zip_file.writestr(f"stamp_{idx+1:02d}.png", apng_data)
+                    
+                    # 1スタンプごとに即座にメモリ解放
+                    del stamp_cells, c_cells, p_frames, proc_f, apng_data
+                    gc.collect()
+                    
                     progress_bar.progress((idx + 1) / total_stamps)
                     
             status_text.text("🎉 すべての変換が完了しました！")
@@ -503,3 +535,5 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
         except Exception as e:
             st.error(f"一括変換中にエラーが発生しました: {e}")
             st.code(traceback.format_exc())
+        finally:
+            gc.collect()
