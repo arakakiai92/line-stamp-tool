@@ -12,7 +12,7 @@ import gc
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="wide")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("見切れボツカット自動除外＆不均等レイアウト対応【超軽量・オンデマンド処理版】")
+st.caption("見切れボツカット自動除外＆不均等レイアウト対応【16:9横長・多分割対応版】")
 
 if 'video_path' not in st.session_state:
     st.session_state['video_path'] = None
@@ -29,7 +29,7 @@ if 'is_vertical' not in st.session_state:
 if 'custom_offsets_dict' not in st.session_state:
     st.session_state['custom_offsets_dict'] = {}
 
-# --- 見切れボツカット自動除外付き 領域検出 ---
+# --- 見切れボツカット自動除外付き 領域検出（16:9・多分割対応） ---
 def detect_content_boxes_robust(frame_bgr, auto_filter_cut=True):
     h, w, _ = frame_bgr.shape
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -41,36 +41,43 @@ def detect_content_boxes_robust(frame_bgr, auto_filter_cut=True):
     
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed)
     raw_boxes = []
-    min_area = h * w * 0.02  # 画面の2%以上
+    
+    # 12分割以上にも対応できるよう最小面積を緩和 (画面全体の0.8%以上)
+    min_area = h * w * 0.008
+    min_dim = min(w, h) * 0.04  # 最小サイズも解像度基準に動的化
     
     for i in range(1, num_labels):
         x, y, bw, bh, area = stats[i]
-        if area >= min_area and bw > 40 and bh > 40:
+        if area >= min_area and bw > min_dim and bh > min_dim:
             raw_boxes.append((int(x), int(y), int(bw), int(bh)))
             
     if not raw_boxes:
         return []
         
     if auto_filter_cut:
-        # 1. 画面の端（余白8px未満）に触れている見切れを除外
+        # 画面の端（余白5px以下）に触れている見切れを除外
         complete_boxes = []
         for x, y, bw, bh in raw_boxes:
-            is_edge_cut = (x <= 8) or ((x + bw) >= (w - 8)) or (y <= 8) or ((y + bh) >= (h - 8))
+            is_edge_cut = (x <= 5) or ((x + bw) >= (w - 5)) or (y <= 5) or ((y + bh) >= (h - 5))
             if not is_edge_cut:
                 complete_boxes.append((x, y, bw, bh))
                 
-        # 2. 完全な枠が見つかった場合は幅の極端な違い（細すぎる枠）も排除
         if len(complete_boxes) > 0:
             median_w = np.median([b[2] for b in complete_boxes])
-            filtered = [b for b in complete_boxes if b[2] >= median_w * 0.7]
+            filtered = [b for b in complete_boxes if b[2] >= median_w * 0.6]
             boxes = filtered if filtered else complete_boxes
         else:
             boxes = raw_boxes
     else:
         boxes = raw_boxes
         
-    # 左から右、上から下の順に整列
-    boxes.sort(key=lambda b: (b[1] // 50, b[0]))
+    if not boxes:
+        return []
+
+    # 行判定のしきい値をスタンプ平均高さの半分に動的設定（上から下・左から右へ確実に整列）
+    avg_h = np.mean([b[3] for b in boxes])
+    row_bin = max(20, int(avg_h * 0.6))
+    boxes.sort(key=lambda b: (b[1] // row_bin, b[0]))
     return boxes
 
 # --- 動画のロード ---
@@ -118,6 +125,8 @@ if st.session_state.get('video_path') is not None:
     
     default_options = [
         "🤖 自動領域検出（見切れボツカットを自動除外）",
+        "均等 12カット (4列 × 3行) 【16:9横長向け】",
+        "均等 8カット (4列 × 2行)",
         "均等 6カット (2列 × 3行)",
         "均等 8カット (2列 × 4行)",
         "均等 10カット (5列 × 2行)",
@@ -143,24 +152,28 @@ if st.session_state.get('video_path') is not None:
         if ret_f:
             boxes_list = detect_content_boxes_robust(first_frame, auto_filter_cut=(not include_cut_edges))
             total_stamps = len(boxes_list)
-            st.success(f"🎯 **有効なカード {total_stamps} 個** を自動検出しました！（見切れカットは自動除外済み）")
+            st.success(f"🎯 **有効なスタンプ {total_stamps} 個** を自動検出しました！（解像度: {w}x{h}）")
         else:
             boxes_list = []
             total_stamps = 0
     else:
         is_auto_detect = False
-        if "6カット" in grid_mode:
+        if "12カット" in grid_mode:
+            ROWS, COLS = 3, 4
+        elif "8カット (4列" in grid_mode:
+            ROWS, COLS = 2, 4
+        elif "6カット" in grid_mode:
             ROWS, COLS = 3, 2
-        elif "8カット" in grid_mode:
+        elif "8カット (2列" in grid_mode:
             ROWS, COLS = 4, 2
         elif "10カット" in grid_mode:
             ROWS, COLS = 2, 5
         else:
             col_c, col_r = st.columns(2)
             with col_c:
-                COLS = st.number_input("横の列数", min_value=1, max_value=10, value=2 if is_vertical else 4, step=1)
+                COLS = st.number_input("横の列数", min_value=1, max_value=12, value=4 if not is_vertical else 2, step=1)
             with col_r:
-                ROWS = st.number_input("縦の行数", min_value=1, max_value=10, value=3 if is_vertical else 1, step=1)
+                ROWS = st.number_input("縦の行数", min_value=1, max_value=12, value=3 if not is_vertical else 4, step=1)
         total_stamps = ROWS * COLS
 
     st.session_state['total_stamps'] = total_stamps
@@ -224,8 +237,8 @@ def draw_preview_boxes(frame_bgr, is_auto, boxes, rows, cols, offset_x=0, offset
         color = (0, 255, 255) if idx == selected_idx else (0, 0, 255)
         thickness = 3 if idx == selected_idx else 2
         cv2.rectangle(preview, (x1, y1), (x2, y2), color, thickness)
-        cv2.putText(preview, f"#{idx+1}", (x1 + 10, y1 + 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4)
-        cv2.putText(preview, f"#{idx+1}", (x1 + 10, y1 + 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+        cv2.putText(preview, f"#{idx+1}", (x1 + 8, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3)
+        cv2.putText(preview, f"#{idx+1}", (x1 + 8, y1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
     return cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
 
 def crop_cell_margins(cell_bgr, crop_l=0, crop_r=0, crop_t=0, crop_b=0):
@@ -301,7 +314,6 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
         st.subheader("🎞️ アニメ ＆ 部分選択設定")
         
         stamp_options = list(range(1, total_stamps + 1))
-        # セレクトボックスの値安全確保
         if 'cur_stamp_num' not in st.session_state or st.session_state['cur_stamp_num'] not in stamp_options:
             st.session_state['cur_stamp_num'] = stamp_options[0]
             
@@ -348,8 +360,7 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
     with col_right:
         st.subheader("✂️ 透過 ＆ マスク設定")
         
-        # 風景カードと透過スタンプ両対応
-        use_transparency = st.checkbox("🎨 白背景を透過する", value=False, help="チェックを外すと、四角い風景カードとしてそのままフルカラー出力されます。")
+        use_transparency = st.checkbox("🎨 白背景を透過する", value=True, help="チェックを外すと、背景白のままフルカラー出力されます。")
         
         if use_transparency:
             tolerance = st.slider("透過感度 (しきい値)", 10, 150, 75, 5, key="tolerance_slider")
@@ -382,7 +393,6 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
             except Exception as e:
                 st.error(f"ガイド表示エラー: {e}")
 
-    # オンデマンド抽出
     try:
         stamp_raw_cells = load_stamp_frames(
             video_path, frame_range[0], frame_range[1], selected_stamp_idx,
