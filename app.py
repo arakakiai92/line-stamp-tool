@@ -12,7 +12,7 @@ import gc
 st.set_page_config(page_title="LINEアニメーションスタンプ自動生成＆高度編集ツール", layout="wide")
 
 st.title("🎬 LINEアニメーションスタンプ自動生成 ＆ 高度編集ツール")
-st.caption("単一素材の全画面切り出し＆グリッド分割両対応【超軽量・オンデマンド処理版】")
+st.caption("軽量・高速処理版（巨大動画メモリ落ち防止・デフォルト4秒/1ループ仕様）")
 
 if 'video_path' not in st.session_state:
     st.session_state['video_path'] = None
@@ -31,9 +31,6 @@ if 'custom_offsets_dict' not in st.session_state:
 
 # --- 単一素材用：動画全体の動きをカバーする大枠検出 ---
 def detect_full_motion_box(video_path, total_frames, sample_count=10, margin=30):
-    """
-    動画全体からサンプリングして、キャラクターが動く全範囲を包含する1つの広い枠を計算
-    """
     cap = cv2.VideoCapture(video_path)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -48,7 +45,6 @@ def detect_full_motion_box(video_path, total_frames, sample_count=10, margin=30)
         if not ret:
             continue
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # 白背景（>240）以外の動体・物体領域を抽出
         non_bg_coords = np.where(gray < 240)
         if len(non_bg_coords[0]) > 0:
             found_any = True
@@ -61,14 +57,13 @@ def detect_full_motion_box(video_path, total_frames, sample_count=10, margin=30)
     if not found_any:
         return (0, 0, w, h)
 
-    # 余白（マージン）を広めに確保
     x1 = max(0, min_x - margin)
     y1 = max(0, min_y - margin)
     x2 = min(w, max_x + margin)
     y2 = min(h, max_y + margin)
     return (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
 
-# --- 見切れボツカット自動除外付き 領域検出（複数カード分割用） ---
+# --- 見切れボツカット自動除外付き 領域検出 ---
 def detect_content_boxes_robust(frame_bgr, auto_filter_cut=True):
     h, w, _ = frame_bgr.shape
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -180,7 +175,7 @@ if st.session_state.get('video_path') is not None:
             boxes_list = [wide_box]
             
         total_stamps = 1
-        st.success(f"🎯 **単一素材モード**: 動画全体の動作領域 (幅 {boxes_list[0][2]}px × 高 {boxes_list[0][3]}px) を広域カバーしました！")
+        st.success(f"🎯 **単一素材モード**: 有効範囲 (幅 {boxes_list[0][2]}px × 高 {boxes_list[0][3]}px) を設定しました")
         
     elif "自動領域検出" in grid_mode:
         is_auto_detect = True
@@ -249,7 +244,10 @@ def get_stamp_crop_coords(idx, frame_shape, is_auto, boxes, rows, cols, offset_x
     y2_c = max(y1_c + 10, min(h_f, int(y2)))
     return x1_c, y1_c, x2_c, y2_c
 
-def load_stamp_frames(video_path, start_f, end_f, idx, is_auto, boxes, rows, cols, offset_x, offset_y, cell_expand, custom_offsets):
+def load_stamp_frames(video_path, start_f, end_f, idx, is_auto, boxes, rows, cols, offset_x, offset_y, cell_expand, custom_offsets, max_dim=320):
+    """
+    メモリ節約のため、切り出しと同時にLINEスタンプ推奨サイズ（長辺最大320px）程度に縮小
+    """
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, start_f - 1))
     extracted = []
@@ -258,7 +256,15 @@ def load_stamp_frames(video_path, start_f, end_f, idx, is_auto, boxes, rows, col
         ret, frame = cap.read()
         if not ret: break
         x1, y1, x2, y2 = get_stamp_crop_coords(idx, frame.shape, is_auto, boxes, rows, cols, offset_x, offset_y, cell_expand, custom_offsets)
-        extracted.append(frame[y1:y2, x1:x2])
+        cell = frame[y1:y2, x1:x2]
+        
+        # 巨大フレームによるメモリ圧迫防止
+        ch, cw = cell.shape[:2]
+        if max(ch, cw) > max_dim:
+            scale = max_dim / max(ch, cw)
+            cell = cv2.resize(cell, (int(cw * scale), int(ch * scale)), interpolation=cv2.INTER_AREA)
+            
+        extracted.append(cell)
         curr += 1
     cap.release()
     gc.collect()
@@ -329,12 +335,14 @@ def process_frame_sequence_strict(frames, target_frame_count=15, ping_pong=False
 def create_preview_gif(frame_list, duration_ms):
     if not frame_list: return b""
     buf = io.BytesIO()
-    frame_list[0].save(buf, format="GIF", save_all=True, append_images=frame_list[1:], duration=duration_ms, loop=0, disposal=2)
+    frame_list[0].save(buf, format="GIF", save_all=True, append_images=frame_list[1:], duration=int(duration_ms), loop=0, disposal=2)
     return buf.getvalue()
 
 def export_apng_lossless(img_list, durations, loop_count):
     buf = io.BytesIO()
-    img_list[0].save(buf, format="PNG", save_all=True, append_images=img_list[1:], duration=durations, loop=loop_count)
+    # 整数ミリ秒であることを厳密に保証
+    clean_durations = [int(max(40, d)) for d in durations]
+    img_list[0].save(buf, format="PNG", save_all=True, append_images=img_list[1:], duration=clean_durations, loop=int(loop_count))
     return buf.getvalue()
 
 # --- ワークスペース ---
@@ -348,7 +356,7 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
     col_left, col_center, col_right = st.columns([1.1, 1.3, 1.1])
     
     with col_left:
-        st.subheader("🎞️ アニメ ＆ 部分選択設定")
+        st.subheader("🎞️ アニメ ＆ 再生設定")
         
         stamp_options = list(range(1, total_stamps + 1))
         if 'cur_stamp_num' not in st.session_state or st.session_state['cur_stamp_num'] not in stamp_options:
@@ -376,9 +384,27 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
         st.markdown("---")
         col_sec, col_loop = st.columns(2)
         with col_sec:
-            target_sec = st.selectbox("総再生時間 (秒)", [1, 2, 3, 4], index=1, key="target_sec_sb")
+            # デフォルト秒数: 4秒
+            target_sec = st.number_input(
+                "総再生時間 (秒)", 
+                min_value=1, 
+                max_value=4, 
+                value=4, 
+                step=1, 
+                help="LINE公式仕様: 1, 2, 3, 4秒のいずれか",
+                key="target_sec_num"
+            )
         with col_loop:
-            loop_count = st.selectbox("ループ回数", [1, 2, 3, 4], index=1, key="loop_count_sb")
+            # デフォルトループ回数: 1回
+            loop_count = st.number_input(
+                "ループ回数", 
+                min_value=1, 
+                max_value=4, 
+                value=1, 
+                step=1, 
+                help="LINE公式仕様: 1〜4回（総再生時間 / ループ回数が1ループの時間になります）",
+                key="loop_count_num"
+            )
 
         st.markdown("---")
         with st.expander("📐 位置・余白微調整", expanded=False):
@@ -435,7 +461,7 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
         stamp_raw_cells = load_stamp_frames(
             video_path, frame_range[0], frame_range[1], selected_stamp_idx,
             is_auto_detect, boxes_list, ROWS, COLS,
-            grid_offset_x, grid_offset_y, grid_expand, custom_offsets
+            grid_offset_x, grid_offset_y, grid_expand, custom_offsets, max_dim=320
         )
         
         cropped_cells = [crop_cell_margins(cell, crop_l, crop_r, crop_t, crop_b) for cell in stamp_raw_cells]
@@ -449,16 +475,19 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
             processed_frames, target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
         )
         
-        total_ms = target_sec * 1000
-        loop_ms = total_ms // loop_count
-        frame_cnt = len(edited_frames)
-        frame_duration_ms = max(50, loop_ms // frame_cnt)
+        # 安全なミリ秒計算（LINE規格: 1コマ40ms以上）
+        total_ms = int(target_sec) * 1000
+        safe_loop_count = max(1, int(loop_count))
+        loop_ms = total_ms // safe_loop_count
+        frame_cnt = max(1, len(edited_frames))
         
-        base_ms = loop_ms // frame_cnt
-        remainder = loop_ms % frame_cnt
+        base_ms = max(40, loop_ms // frame_cnt)
+        remainder = max(0, loop_ms - (base_ms * frame_cnt))
         durations_list = [base_ms] * frame_cnt
-        for i in range(remainder):
+        for i in range(min(remainder, frame_cnt)):
             durations_list[i] += 1
+            
+        frame_duration_ms = durations_list[0]
             
     except Exception as e:
         st.error(f"スタンプ編集処理エラー: {e}")
@@ -470,9 +499,9 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
         if edited_frames:
             try:
                 preview_gif = create_preview_gif(edited_frames, frame_duration_ms)
-                st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} | コマ数: {frame_cnt}コマ / 1コマ {frame_duration_ms}ms", use_container_width=True)
+                st.image(preview_gif, caption=f"スタンプ #{selected_stamp_idx + 1} | コマ数: {frame_cnt}コマ / 1コマ {frame_duration_ms}ms (ループ時間: {loop_ms}ms)", use_container_width=True)
                 
-                single_apng_data = export_apng_lossless(edited_frames, durations_list, loop_count)
+                single_apng_data = export_apng_lossless(edited_frames, durations_list, safe_loop_count)
                 st.download_button(
                     label=f"💾 スタンプ #{selected_stamp_idx + 1} をダウンロード (APNG)",
                     data=single_apng_data,
@@ -480,7 +509,7 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
                     mime="image/png",
                     key="single_dl_btn"
                 )
-                st.success(f"✨ 正常稼働中: 全{frame_cnt}コマ (1コマあたり {frame_duration_ms}ms)")
+                st.success(f"✨ 安定稼働中: 全{frame_cnt}コマ | {target_sec}秒・{safe_loop_count}ループ")
             except Exception as e:
                 st.error(f"プレビュー描画エラー: {e}")
                 
@@ -495,8 +524,9 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
         
         try:
             zip_buffer = io.BytesIO()
-            total_ms = target_sec * 1000
-            loop_ms = total_ms // loop_count
+            total_ms = int(target_sec) * 1000
+            safe_loop_count = max(1, int(loop_count))
+            loop_ms = total_ms // safe_loop_count
             
             with zipfile.ZipFile(zip_buffer, "w") as zip_file:
                 for idx in range(total_stamps):
@@ -505,7 +535,7 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
                     stamp_cells = load_stamp_frames(
                         video_path, frame_range[0], frame_range[1], idx,
                         is_auto_detect, boxes_list, ROWS, COLS,
-                        grid_offset_x, grid_offset_y, grid_expand, custom_offsets
+                        grid_offset_x, grid_offset_y, grid_expand, custom_offsets, max_dim=320
                     )
                     
                     c_cells = [crop_cell_margins(cell, crop_l, crop_r, crop_t, crop_b) for cell in stamp_cells]
@@ -518,14 +548,14 @@ if st.session_state.get('video_path') is not None and total_stamps > 0:
                         p_frames, target_frame_count=target_frame_count, ping_pong=ping_pong, trim_end=trim_end
                     )
                     
-                    f_cnt = len(proc_f)
-                    b_ms = loop_ms // f_cnt
-                    rem = loop_ms % f_cnt
+                    f_cnt = max(1, len(proc_f))
+                    b_ms = max(40, loop_ms // f_cnt)
+                    rem = max(0, loop_ms - (b_ms * f_cnt))
                     d_list = [b_ms] * f_cnt
-                    for i in range(rem):
+                    for i in range(min(rem, f_cnt)):
                         d_list[i] += 1
                         
-                    apng_data = export_apng_lossless(proc_f, d_list, loop_count)
+                    apng_data = export_apng_lossless(proc_f, d_list, safe_loop_count)
                     zip_file.writestr(f"stamp_{idx+1:02d}.png", apng_data)
                     progress_bar.progress((idx + 1) / total_stamps)
                     
